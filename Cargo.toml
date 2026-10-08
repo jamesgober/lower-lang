@@ -1,0 +1,78 @@
+# =============================================================================
+#  R E P S   ·   lower-lang
+# =============================================================================
+[package]
+name    = "lower-lang"
+version = "0.1.0"
+
+# Minimum Supported Rust Version (MSRV)
+rust-version = "1.85"
+edition = "2024"
+
+# License
+license = "Apache-2.0 OR MIT"
+
+# Readme
+readme = "README.md"
+
+# Description
+description = "Lowers lossless syntax trees into HIR through declarative semantic archetypes and hygienic templates."
+
+# Keywords (5 max)
+keywords = ["lowering", "hir", "compiler", "language", "lexersketch"]
+
+# Categories
+categories = ["compilers", "development-tools", "no-std"]
+
+# Links
+homepage      = "https://github.com/jamesgober/lower-lang"
+repository    = "https://github.com/jamesgober/lower-lang"
+documentation = "https://docs.rs/lower-lang"
+
+# Authors
+authors = ["James Gober <me@jamesgober.com>"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "lower_lang"
+path = "src/lib.rs"
+
+
+# FEATURE FLAGS
+# #################################
+[features]
+default = ["std"]
+std = []
+
+
+# DEPENDENCIES
+# #################################
+[dependencies]
+# First-party -lang dependencies are wired at v0.2.0, when first used.
+
+
+# DEV DEPENDENCIES
+# #################################
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest  = "1"
+
+
+# BENCHMARKS
+# #################################
+[[bench]]
+name    = "bench"
+harness = false
+
+
+# RELEASE PROFILE
+# #################################
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
