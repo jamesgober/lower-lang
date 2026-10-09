@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "lower-lang"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -45,13 +45,22 @@ path = "src/lib.rs"
 # #################################
 [features]
 default = ["std"]
-std = []
+# The standard library. Without it the crate is `no_std` and needs only `alloc`.
+std = ["hir-lang/std", "syntax-lang/std", "intern-lang/std"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-# First-party -lang dependencies are wired at v0.2.0, when first used.
+# The input: a lossless syntax tree, generic over the language's kind type `K`.
+# Its `Span` (span-lang 0.4) is the same type hir-lang's origins carry.
+syntax-lang = { version = "1", default-features = false }
+# The output: HIR. Lowering builds it with hir-lang's `Builder`, records one
+# expansion per template instantiation, and validates with `finish_lenient`.
+hir-lang = { version = "0.3", default-features = false }
+# Names: HIR names are `intern_lang::Symbol`s of the session's interner, which
+# the caller passes in so names line up with the rest of the front end.
+intern-lang = { version = "1", default-features = false }
 
 
 # DEV DEPENDENCIES
@@ -59,6 +68,9 @@ std = []
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
+# The worked example language in the tests, example, and benchmarks is forged
+# from an `.lsf` schematic by lang-forge (registry dev-dependency, never a path).
+lang-forge = "1.0.1"
 
 
 # BENCHMARKS

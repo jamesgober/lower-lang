@@ -1,0 +1,1516 @@
+//! The mapping: a language's semantics as data.
+//!
+//! A [`Mapping`] mirrors LexerSketch's LSF2 `[semantics]` sections:
+//! node kinds to [`Arch`]etypes (`[semantics.bind]`), templates
+//! (`[semantics.lower]`), and operators with their policies
+//! (`[semantics.ops]`), plus the token roles, modifiers, and path roots that
+//! the archetypes read. Build one with a [`MappingBuilder`]; it is immutable,
+//! `Send` and `Sync` when `K` is, and lowers any number of trees.
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::fmt;
+
+use hir_lang::{DivZero, FloatToInt, Op, OpKind, Overflow, PathRoot, Prim, Shift};
+
+use crate::arch::{Arch, TemplateUse};
+use crate::pick::{KindSets, Pick};
+use crate::template::{HoleKind, NONE, TArg, TNode, Template, TemplateId};
+
+/// What a token means when it is lowered on its own.
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::{Escapes, TokenRole};
+///
+/// let var = TokenRole::Var { sigil: 1 };       // `$name`, name `name`
+/// let string = TokenRole::Str(Escapes::Standard);
+/// assert_ne!(var, string);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TokenRole {
+    /// An identifier: a name, a variable reference, a binding, or a type name.
+    Name,
+    /// A sigiled variable such as `$x`; the first `sigil` bytes are not part
+    /// of the name.
+    Var {
+        /// Bytes to strip.
+        sigil: u8,
+    },
+    /// A loop label such as `'outer`.
+    Label {
+        /// Bytes to strip.
+        sigil: u8,
+    },
+    /// A region (lifetime) such as `'a`, as a generic parameter or argument.
+    Lifetime {
+        /// Bytes to strip.
+        sigil: u8,
+    },
+    /// An integer literal (`0x`, `0o`, `0b` prefixes and `_` separators
+    /// accepted; a registered suffix sets its type).
+    Int,
+    /// A floating-point literal.
+    Float,
+    /// A number: a float if it has a fraction or an exponent, else an integer.
+    Number,
+    /// A string literal, quotes included in the token.
+    Str(Escapes),
+    /// A character literal, quotes included.
+    Char(Escapes),
+    /// A byte-string literal, quotes (and a leading `b`) included.
+    Bytes(Escapes),
+    /// `true`.
+    True,
+    /// `false`.
+    False,
+    /// `null` / `nil` / `None`-as-keyword.
+    Null,
+    /// `_`: a wildcard pattern, or an inferred type.
+    Wild,
+    /// `..` inside a pattern.
+    Rest,
+    /// A type keyword (`int`, `mixed`, `Self`, `!`).
+    Type(TypeName),
+}
+
+/// How a string or character literal's escapes are decoded.
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::Escapes;
+///
+/// assert_ne!(Escapes::None, Escapes::Standard);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Escapes {
+    /// Raw: the text between the quotes, unchanged.
+    None,
+    /// Only `\\` and an escaped quote (PHP single-quoted strings).
+    Quotes,
+    /// `\n \r \t \0 \\ \' \" \$ \xHH \u{H..}`; any other escape is reported
+    /// and kept as written.
+    Standard,
+}
+
+/// A type keyword's meaning.
+///
+/// # Examples
+///
+/// ```
+/// use hir_lang::Prim;
+/// use lower_lang::TypeName;
+///
+/// assert_eq!(TypeName::Prim(Prim::I64), TypeName::Prim(Prim::I64));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TypeName {
+    /// A primitive type.
+    Prim(Prim),
+    /// The gradual dynamic type (`mixed`, `any`).
+    Any,
+    /// The type of expressions that never complete (`never`, `!`).
+    Never,
+    /// `Self`.
+    SelfTy,
+    /// A type to infer (`_`, `auto`).
+    Infer,
+}
+
+/// A keyword or symbol that sets a flag on the construct it appears in.
+///
+/// Modifiers are read from the **direct** significant children of the
+/// archetypes that consult them (listed on each [`Arch`] variant), so a token
+/// can be a modifier in one construct and something else elsewhere.
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::Modifier;
+///
+/// assert_ne!(Modifier::Public, Modifier::Mut);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Modifier {
+    /// `pub`, `public`.
+    Public,
+    /// `protected`.
+    Protected,
+    /// `private`.
+    Private,
+    /// `pub(crate)`, `internal`.
+    Package,
+    /// `mut`, `var`.
+    Mut,
+    /// `&` / `ref`: by reference (parameters, captures, bindings, arguments).
+    Ref,
+    /// `...` / `*` on a parameter: variadic.
+    Rest,
+    /// `**` on a parameter: collects named arguments.
+    RestNamed,
+    /// A `*` marker in a parameter list: the parameters after it are named-only.
+    NamedOnly,
+    /// A `/` marker in a parameter list: the parameters before it are
+    /// positional-only.
+    PositionalOnly,
+    /// `self` as a parameter: the method receiver.
+    Receiver,
+    /// `async`.
+    Async,
+    /// `*` on a function (`function*`), `gen`: a generator.
+    Generator,
+    /// `throws`.
+    Throws,
+    /// `unsafe`.
+    Unsafe,
+    /// `static` on a class member.
+    Static,
+    /// `abstract`.
+    Abstract,
+    /// `final`.
+    Final,
+    /// `*` in an import: a glob.
+    Glob,
+    /// `..=`: an inclusive range pattern.
+    Inclusive,
+    /// `...` on an argument: spread positional arguments.
+    Spread,
+    /// `**` on an argument: spread named arguments.
+    SpreadNamed,
+    /// `union` on a record.
+    Union,
+}
+
+impl Modifier {
+    pub(crate) const fn bit(self) -> u32 {
+        1 << (self as u32)
+    }
+}
+
+/// How a function's effects are decided.
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::EffectMode;
+///
+/// assert_eq!(EffectMode::default(), EffectMode::Declared);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum EffectMode {
+    /// Only what modifiers declare (`async`, `throws`, generator markers).
+    #[default]
+    Declared,
+    /// Declared, plus whatever the body does directly (a `yield` makes a
+    /// generator, as in PHP and Python; a `throw` makes it throwing).
+    Inferred,
+    /// Every function, closure, and module body has the effect (any PHP
+    /// function may throw).
+    Always,
+}
+
+/// How a bare identifier in a `match` arm pattern is lowered.
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::IdentPatterns;
+///
+/// assert_eq!(IdentPatterns::default(), IdentPatterns::Ident);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum IdentPatterns {
+    /// `Pat::Ident`: the resolver decides between a constant or unit variant
+    /// and a new binding (Rust, Kraken).
+    #[default]
+    Ident,
+    /// Always a new binding.
+    Bind,
+}
+
+/// Which call arguments are passed as places, so a by-reference parameter can
+/// alias them.
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::PlaceArgs;
+///
+/// assert_eq!(PlaceArgs::default(), PlaceArgs::Marked);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PlaceArgs {
+    /// Only arguments with a `Ref` modifier (`f(&$x)` in old PHP, `ref x` in
+    /// C#).
+    #[default]
+    Marked,
+    /// Every argument that is a place (a variable, field, index, ...); the
+    /// callee decides at run time whether to alias it (PHP and Mox, where
+    /// by-reference is declared on the parameter).
+    Places,
+}
+
+/// Language-wide lowering policies.
+///
+/// `#[non_exhaustive]`: start from [`LangPolicy::default`] and assign fields.
+///
+/// # Examples
+///
+/// ```
+/// use hir_lang::Overflow;
+/// use lower_lang::{EffectMode, LangPolicy, PlaceArgs};
+///
+/// // Mox: PHP-like integers, any function may throw, implicit locals.
+/// let mut mox = LangPolicy::default();
+/// mox.overflow = Overflow::Promote;
+/// mox.throws = EffectMode::Always;
+/// mox.yields = EffectMode::Inferred;
+/// mox.implicit_locals = true;
+/// mox.place_args = PlaceArgs::Places;
+/// assert!(mox.implicit_locals);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct LangPolicy {
+    /// The overflow policy of every op that consults one (OPS §2).
+    pub overflow: Overflow,
+    /// The division-by-zero policy.
+    pub div_zero: DivZero,
+    /// The shift-amount policy.
+    pub shift: Shift,
+    /// The float-to-integer conversion policy.
+    pub float_to_int: FloatToInt,
+    /// When functions, closures, and module bodies throw.
+    pub throws: EffectMode,
+    /// When they are generators.
+    pub yields: EffectMode,
+    /// When they are async.
+    pub asyncs: EffectMode,
+    /// PHP-style implicit declaration: assigning to a plain variable declares
+    /// it for the whole enclosing function (or module body) unless a
+    /// parameter, `global`, or `static` already does.
+    pub implicit_locals: bool,
+    /// Bare identifiers in `match` arm patterns.
+    pub ident_patterns: IdentPatterns,
+    /// Which arguments are passed as places.
+    pub place_args: PlaceArgs,
+}
+
+impl Default for LangPolicy {
+    fn default() -> Self {
+        Self {
+            overflow: Overflow::Error,
+            div_zero: DivZero::Error,
+            shift: Shift::Error,
+            float_to_int: FloatToInt::Error,
+            throws: EffectMode::Declared,
+            yields: EffectMode::Declared,
+            asyncs: EffectMode::Declared,
+            implicit_locals: false,
+            ident_patterns: IdentPatterns::Ident,
+            place_args: PlaceArgs::Marked,
+        }
+    }
+}
+
+/// A host or intrinsic name stored in a mapping, from
+/// [`MappingBuilder::name`].
+///
+/// # Examples
+///
+/// ```
+/// let mut b = lower_lang::MappingBuilder::<u8>::new();
+/// let concat = b.name("mox.concat");
+/// assert_ne!(concat, b.name("mox.echo"));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NameRef(pub(crate) u32);
+
+/// What an operator token lowers to.
+///
+/// # Examples
+///
+/// ```
+/// use hir_lang::{Op, OpKind, Overflow};
+/// use lower_lang::OpSpec;
+///
+/// let plus = OpSpec::Op(OpKind::Add);                       // language policy
+/// let wrapping = OpSpec::OpWith(Op::new(OpKind::Add).with_overflow(Overflow::Wrap));
+/// let plus_eq = OpSpec::Compound(OpKind::Add);              // `+=`
+/// assert_ne!(plus, wrapping);
+/// assert_ne!(plus, plus_eq);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OpSpec {
+    /// An intrinsic op with the language's policies ([`LangPolicy`]).
+    Op(OpKind),
+    /// An intrinsic op with exactly this policy (`[semantics.ops] "/" = { op =
+    /// "div", zero = "trap" }`).
+    OpWith(Op),
+    /// Compound assignment (`+=`) with the language's policies.
+    Compound(OpKind),
+    /// Compound assignment with exactly this policy.
+    CompoundWith(Op),
+    /// Plain assignment (`=` as an operator).
+    Assign,
+    /// Reference assignment (`=&`).
+    RefAssign,
+    /// The operand itself (unary `+`).
+    Identity,
+    /// `&x` / `&mut x` as a prefix operator.
+    Borrow(hir_lang::BorrowKind),
+    /// `*x` as a prefix operator.
+    Deref,
+    /// `await x` (prefix) or `x.await` (postfix).
+    Await,
+    /// A template whose expression holes receive the operands, in order
+    /// (`&&`, `||`, `??`, `x++`).
+    Template(TemplateId),
+    /// A call of a host function with the operands as arguments (Mox `.`
+    /// string concatenation).
+    Extern(NameRef),
+    /// A named backend intrinsic applied to the operands.
+    Intrinsic(NameRef),
+}
+
+/// Ops a compound assignment may use (HIR §8.2).
+const COMPOUND: [OpKind; 11] = [
+    OpKind::Add,
+    OpKind::Sub,
+    OpKind::Mul,
+    OpKind::Div,
+    OpKind::FloorDiv,
+    OpKind::Rem,
+    OpKind::FloorMod,
+    OpKind::And,
+    OpKind::Or,
+    OpKind::Xor,
+    OpKind::Shl,
+];
+
+pub(crate) fn compound_ok(kind: OpKind) -> bool {
+    COMPOUND.contains(&kind) || kind == OpKind::Shr
+}
+
+/// Operator positions, for the tables and errors.
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::Fixity;
+///
+/// assert_eq!(Fixity::Binary.arity(), 2);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fixity {
+    /// Before the operand.
+    Prefix,
+    /// Between two operands.
+    Binary,
+    /// After the operand.
+    Postfix,
+}
+
+impl Fixity {
+    /// The number of operands.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(lower_lang::Fixity::Prefix.arity(), 1);
+    /// ```
+    #[must_use]
+    pub const fn arity(self) -> usize {
+        match self {
+            Self::Binary => 2,
+            Self::Prefix | Self::Postfix => 1,
+        }
+    }
+}
+
+/// Why a mapping was refused.
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::{Arch, MappingBuilder, MappingError, Pick};
+///
+/// let mut b = MappingBuilder::<u8>::new();
+/// b.node(1, Arch::If { cond: Pick::Absent, then: Pick::Nth(1), else_: Pick::Absent });
+/// assert_eq!(b.build().unwrap_err(), MappingError::MissingField { rule: 0, field: "cond" });
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MappingError {
+    /// Rule `rule` (in registration order) leaves a required field `Absent`.
+    MissingField {
+        /// The rule's registration index.
+        rule: usize,
+        /// The field.
+        field: &'static str,
+    },
+    /// A kind has two entries in a table that allows one (`table` names it:
+    /// "token role", "modifier", "root", "prefix operator", ...).
+    DuplicateKind {
+        /// The table.
+        table: &'static str,
+        /// The later entry's registration index in that table.
+        index: usize,
+    },
+    /// A type name is registered twice.
+    DuplicateTypeName {
+        /// The later entry's registration index.
+        index: usize,
+    },
+    /// A template id that this mapping did not issue (or, inside a template,
+    /// one not registered before it).
+    UnknownTemplate {
+        /// The id's index.
+        template: usize,
+    },
+    /// A node binds a template with the wrong number of picks.
+    HoleCount {
+        /// The rule's registration index.
+        rule: usize,
+        /// The template's hole count.
+        expected: usize,
+        /// The picks given.
+        found: usize,
+    },
+    /// An `apply` inside template `template` passes arguments that do not
+    /// match the applied template's holes (count, or kind, or `Absent` for a
+    /// required hole).
+    ApplyArgs {
+        /// The registering template's index.
+        template: usize,
+    },
+    /// An operator maps to a spec that cannot apply at its position: an op of
+    /// the wrong arity, a compound op HIR does not allow, a policy that does
+    /// not fit its op, assignment outside binary position, identity outside
+    /// unary position, or a template whose holes are not one expression per
+    /// operand.
+    BadOperator {
+        /// The operator's position.
+        fixity: Fixity,
+        /// Its registration index in that table.
+        index: usize,
+    },
+    /// A table outgrew its index type.
+    TooLarge,
+}
+
+impl fmt::Display for MappingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingField { rule, field } => {
+                write!(f, "rule {rule}: required field `{field}` has no pick")
+            }
+            Self::DuplicateKind { table, index } => {
+                write!(f, "{table} {index}: the kind already has an entry")
+            }
+            Self::DuplicateTypeName { index } => write!(f, "type name {index} is registered twice"),
+            Self::UnknownTemplate { template } => {
+                write!(f, "template {template} is not registered")
+            }
+            Self::HoleCount {
+                rule,
+                expected,
+                found,
+            } => write!(
+                f,
+                "rule {rule}: the template has {expected} holes, {found} picks given"
+            ),
+            Self::ApplyArgs { template } => {
+                write!(
+                    f,
+                    "template {template}: an `apply` does not match the applied template's holes"
+                )
+            }
+            Self::BadOperator { fixity, index } => {
+                write!(
+                    f,
+                    "{fixity:?} operator {index} maps to a spec that cannot apply there"
+                )
+            }
+            Self::TooLarge => f.write_str("a mapping table outgrew its index type"),
+        }
+    }
+}
+
+impl core::error::Error for MappingError {}
+
+/// One node rule: an archetype, applied when `when` finds something (or
+/// always, when `when` is `Absent`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Rule<K> {
+    pub(crate) when: Pick<K>,
+    pub(crate) arch: Arch<K>,
+}
+
+/// A language's semantics as data: what each node kind means, what each token
+/// is, which operators map to what, and the templates for sugar.
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::{Arch, MappingBuilder, Pick, TokenRole};
+///
+/// const IDENT: u8 = 1;
+/// const LET: u8 = 2;
+/// let mut b = MappingBuilder::new();
+/// b.token(IDENT, TokenRole::Name);
+/// b.node(LET, Arch::Let {
+///     pat: Pick::Kind(IDENT),
+///     ty: Pick::Absent,
+///     init: Pick::Back(0),
+///     else_: Pick::Absent,
+///     mutable: false,
+///     hoist: false,
+/// });
+/// let mapping = b.build()?;
+/// assert_eq!(mapping.role_for(&IDENT), Some(TokenRole::Name));
+/// assert!(mapping.rule_for(&LET).is_some());
+/// # Ok::<(), lower_lang::MappingError>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct Mapping<K> {
+    pub(crate) rules: Vec<Rule<K>>,
+    pub(crate) by_kind: Vec<(K, u32)>,
+    pub(crate) roles: Vec<(K, TokenRole)>,
+    pub(crate) modifiers: Vec<(K, Modifier)>,
+    pub(crate) roots: Vec<(K, PathRoot)>,
+    pub(crate) containers: Vec<K>,
+    pub(crate) skips: Vec<K>,
+    pub(crate) errors: Vec<K>,
+    pub(crate) type_names: Vec<(Box<str>, TypeName)>,
+    pub(crate) suffixes: Vec<(Box<str>, Prim)>,
+    pub(crate) prefix: Vec<(K, OpSpec)>,
+    pub(crate) binary: Vec<(K, OpSpec)>,
+    pub(crate) postfix: Vec<(K, OpSpec)>,
+    pub(crate) templates: Vec<Template>,
+    pub(crate) template_names: Vec<u32>,
+    pub(crate) hole_picks: Vec<Pick<K>>,
+    pub(crate) strings: Vec<Box<str>>,
+    pub(crate) policy: LangPolicy,
+}
+
+fn find<'a, K: Ord, V>(table: &'a [(K, V)], kind: &K) -> Option<&'a V> {
+    table
+        .binary_search_by(|(k, _)| k.cmp(kind))
+        .ok()
+        .and_then(|i| table.get(i))
+        .map(|(_, v)| v)
+}
+
+impl<K: Copy + Ord> Mapping<K> {
+    /// The archetype of the first rule registered for `kind`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{Arch, MappingBuilder};
+    ///
+    /// let mut b = MappingBuilder::<u8>::new();
+    /// b.node(3, Arch::binary());
+    /// let m = b.build()?;
+    /// assert_eq!(m.rule_for(&3), Some(&Arch::binary()));
+    /// assert_eq!(m.rule_for(&4), None);
+    /// # Ok::<(), lower_lang::MappingError>(())
+    /// ```
+    #[must_use]
+    pub fn rule_for(&self, kind: &K) -> Option<&Arch<K>> {
+        let (start, _) = self.rule_range(kind);
+        self.by_kind
+            .get(start)
+            .filter(|(k, _)| k == kind)
+            .and_then(|(_, r)| self.rules.get(*r as usize))
+            .map(|r| &r.arch)
+    }
+
+    /// The role of token kind `kind`.
+    ///
+    /// # Examples
+    ///
+    /// See [`Mapping`].
+    #[must_use]
+    pub fn role_for(&self, kind: &K) -> Option<TokenRole> {
+        find(&self.roles, kind).copied()
+    }
+
+    /// The modifier token kind `kind` stands for.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{MappingBuilder, Modifier};
+    ///
+    /// let mut b = MappingBuilder::<u8>::new();
+    /// b.modifier(9, Modifier::Mut);
+    /// assert_eq!(b.build()?.modifier_for(&9), Some(Modifier::Mut));
+    /// # Ok::<(), lower_lang::MappingError>(())
+    /// ```
+    #[must_use]
+    pub fn modifier_for(&self, kind: &K) -> Option<Modifier> {
+        find(&self.modifiers, kind).copied()
+    }
+
+    /// The registered template `id`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{templates, MappingBuilder};
+    ///
+    /// let mut b = MappingBuilder::<u8>::new();
+    /// let id = b.template(templates::coalesce())?;
+    /// let m = b.build()?;
+    /// assert_eq!(m.template(id).map(|t| t.name()), Some("??"));
+    /// # Ok::<(), lower_lang::MappingError>(())
+    /// ```
+    #[must_use]
+    pub fn template(&self, id: TemplateId) -> Option<&Template> {
+        self.templates.get(id.index())
+    }
+
+    /// The language-wide policies.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{LangPolicy, MappingBuilder};
+    ///
+    /// let m = MappingBuilder::<u8>::new().build()?;
+    /// assert_eq!(*m.policy(), LangPolicy::default());
+    /// # Ok::<(), lower_lang::MappingError>(())
+    /// ```
+    #[must_use]
+    pub const fn policy(&self) -> &LangPolicy {
+        &self.policy
+    }
+
+    /// The rules registered for `kind`, as an index range into `by_kind`.
+    pub(crate) fn rule_range(&self, kind: &K) -> (usize, usize) {
+        let start = self.by_kind.partition_point(|(k, _)| k < kind);
+        let end = start
+            + self
+                .by_kind
+                .get(start..)
+                .map_or(0, |rest| rest.partition_point(|(k, _)| k == kind));
+        (start, end)
+    }
+
+    pub(crate) fn op(&self, fixity: Fixity, kind: &K) -> Option<OpSpec> {
+        let table = match fixity {
+            Fixity::Prefix => &self.prefix,
+            Fixity::Binary => &self.binary,
+            Fixity::Postfix => &self.postfix,
+        };
+        find(table, kind).copied()
+    }
+
+    pub(crate) fn root_for(&self, kind: &K) -> Option<PathRoot> {
+        find(&self.roots, kind).copied()
+    }
+
+    pub(crate) fn is_error(&self, kind: &K) -> bool {
+        self.errors.binary_search(kind).is_ok()
+    }
+
+    pub(crate) fn type_name(&self, text: &str) -> Option<TypeName> {
+        self.type_names
+            .binary_search_by(|(t, _)| (**t).cmp(text))
+            .ok()
+            .and_then(|i| self.type_names.get(i))
+            .map(|(_, n)| *n)
+    }
+}
+
+impl<K: Ord> KindSets<K> for Mapping<K> {
+    fn is_skip(&self, kind: &K) -> bool {
+        self.skips.binary_search(kind).is_ok()
+    }
+    fn is_container(&self, kind: &K) -> bool {
+        self.containers.binary_search(kind).is_ok()
+    }
+}
+
+/// Builds a [`Mapping`]. Every method records; [`build`](Self::build) checks
+/// everything and sorts the tables.
+///
+/// # Examples
+///
+/// A calculator's semantics: statements, `let`, numbers, names, and `+ - * /`.
+///
+/// ```
+/// use hir_lang::OpKind;
+/// use lower_lang::{Arch, MappingBuilder, OpSpec, Pick, TokenRole};
+///
+/// #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// enum K { Program, Let, Binary, Ident, Number, Plus, Star, Eq, Semi }
+///
+/// let mut b = MappingBuilder::new();
+/// b.node(K::Program, Arch::Module { name: Pick::Absent, items: Pick::Nodes });
+/// b.node(K::Let, Arch::Let {
+///     pat: Pick::Kind(K::Ident), ty: Pick::Absent, init: Pick::After(K::Eq),
+///     else_: Pick::Absent, mutable: false, hoist: false,
+/// });
+/// b.node(K::Binary, Arch::binary());
+/// b.token(K::Ident, TokenRole::Name);
+/// b.token(K::Number, TokenRole::Number);
+/// b.binary_op(K::Plus, OpSpec::Op(OpKind::Add));
+/// b.binary_op(K::Star, OpSpec::Op(OpKind::Mul));
+/// b.skip(K::Semi);
+/// let mapping = b.build()?;
+/// # let _ = mapping;
+/// # Ok::<(), lower_lang::MappingError>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct MappingBuilder<K> {
+    m: Mapping<K>,
+    rule_picks_error: Option<MappingError>,
+}
+
+impl<K: Copy + Ord> Default for MappingBuilder<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: Copy + Ord> MappingBuilder<K> {
+    /// An empty builder with the default [`LangPolicy`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let m = lower_lang::MappingBuilder::<u8>::new().build()?;
+    /// assert!(m.rule_for(&0).is_none());
+    /// # Ok::<(), lower_lang::MappingError>(())
+    /// ```
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            m: Mapping {
+                rules: Vec::new(),
+                by_kind: Vec::new(),
+                roles: Vec::new(),
+                modifiers: Vec::new(),
+                roots: Vec::new(),
+                containers: Vec::new(),
+                skips: Vec::new(),
+                errors: Vec::new(),
+                type_names: Vec::new(),
+                suffixes: Vec::new(),
+                prefix: Vec::new(),
+                binary: Vec::new(),
+                postfix: Vec::new(),
+                templates: Vec::new(),
+                template_names: Vec::new(),
+                hole_picks: Vec::new(),
+                strings: Vec::new(),
+                policy: LangPolicy::default(),
+            },
+            rule_picks_error: None,
+        }
+    }
+
+    fn add_rule(&mut self, kind: K, when: Pick<K>, arch: Arch<K>) -> &mut Self {
+        match u32::try_from(self.m.rules.len()) {
+            Ok(i) if i < NONE => {
+                self.m.rules.push(Rule { when, arch });
+                self.m.by_kind.push((kind, i));
+            }
+            _ => self.rule_picks_error = Some(MappingError::TooLarge),
+        }
+        self
+    }
+
+    /// Nodes of `kind` mean `arch`.
+    ///
+    /// # Examples
+    ///
+    /// See [`MappingBuilder`].
+    pub fn node(&mut self, kind: K, arch: Arch<K>) -> &mut Self {
+        self.add_rule(kind, Pick::Absent, arch)
+    }
+
+    /// Nodes of `kind` mean `arch` when `when` finds a child; otherwise the
+    /// next rule for `kind` (in registration order) is tried. For grammars
+    /// that put alternatives in one rule (`stmt = "'let' ... | expr ';'"`).
+    /// A node no rule applies to is reported as unmapped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{Arch, MappingBuilder, Pick};
+    ///
+    /// const STMT: u8 = 1;
+    /// const LET: u8 = 2;
+    /// let mut b = MappingBuilder::new();
+    /// b.node_when(STMT, Pick::First(LET), Arch::Let {
+    ///     pat: Pick::Nth(1), ty: Pick::Absent, init: Pick::Nth(3),
+    ///     else_: Pick::Absent, mutable: false, hoist: false,
+    /// });
+    /// b.node(STMT, Arch::ExprStmt { expr: Pick::Nth(0) });
+    /// assert!(b.build().is_ok());
+    /// ```
+    pub fn node_when(&mut self, kind: K, when: Pick<K>, arch: Arch<K>) -> &mut Self {
+        self.add_rule(kind, when, arch)
+    }
+
+    /// Tokens of `kind` mean `role`.
+    ///
+    /// # Examples
+    ///
+    /// See [`Mapping`].
+    pub fn token(&mut self, kind: K, role: TokenRole) -> &mut Self {
+        self.m.roles.push((kind, role));
+        self
+    }
+
+    /// Tokens of `kind` set `modifier` on the construct they appear in.
+    ///
+    /// # Examples
+    ///
+    /// See [`Mapping::modifier_for`].
+    pub fn modifier(&mut self, kind: K, modifier: Modifier) -> &mut Self {
+        self.m.modifiers.push((kind, modifier));
+        self
+    }
+
+    /// Leading tokens of `kind` in a [`Path`](Arch::Path) set its root
+    /// (`self` → `SelfModule`, `super` → `Super(1)` each, `Self` → `SelfType`,
+    /// PHP `parent`/`static` → `ParentType`/`StaticType`, `::` → `Global`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::PathRoot;
+    ///
+    /// let mut b = lower_lang::MappingBuilder::<u8>::new();
+    /// b.root(5, PathRoot::Super(1));
+    /// assert!(b.build().is_ok());
+    /// ```
+    pub fn root(&mut self, kind: K, root: PathRoot) -> &mut Self {
+        self.m.roots.push((kind, root));
+        self
+    }
+
+    /// Nodes of `kind` are containers: list picks splice their children in
+    /// place (an `args` node inside a `call`, a `params` node inside a `fn`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut b = lower_lang::MappingBuilder::<u8>::new();
+    /// b.container(7);
+    /// assert!(b.build().is_ok());
+    /// ```
+    pub fn container(&mut self, kind: K) -> &mut Self {
+        self.m.containers.push(kind);
+        self
+    }
+
+    /// Tokens (or nodes) of `kind` are punctuation that list picks leave out
+    /// (`,`, `;`, `(`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut b = lower_lang::MappingBuilder::<u8>::new();
+    /// b.skip(8);
+    /// assert!(b.build().is_ok());
+    /// ```
+    pub fn skip(&mut self, kind: K) -> &mut Self {
+        self.m.skips.push(kind);
+        self
+    }
+
+    /// Nodes of `kind` are syntax errors (lang-forge's `ERROR`): they lower to
+    /// error forms with a [`SyntaxError`](crate::ProblemKind::SyntaxError)
+    /// problem, whatever context they appear in.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut b = lower_lang::MappingBuilder::<u8>::new();
+    /// b.error(0);
+    /// assert!(b.build().is_ok());
+    /// ```
+    pub fn error(&mut self, kind: K) -> &mut Self {
+        self.m.errors.push(kind);
+        self
+    }
+
+    /// An identifier spelled `text` names this type (`int` → `i64`, `mixed`
+    /// → any).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::Prim;
+    /// use lower_lang::TypeName;
+    ///
+    /// let mut b = lower_lang::MappingBuilder::<u8>::new();
+    /// b.type_name("int", TypeName::Prim(Prim::I64));
+    /// assert!(b.build().is_ok());
+    /// ```
+    pub fn type_name(&mut self, text: &str, name: TypeName) -> &mut Self {
+        self.m.type_names.push((text.into(), name));
+        self
+    }
+
+    /// A numeric literal ending in `suffix` has that type (`10u8`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::Prim;
+    ///
+    /// let mut b = lower_lang::MappingBuilder::<u8>::new();
+    /// b.suffix("u8", Prim::U8);
+    /// assert!(b.build().is_ok());
+    /// ```
+    pub fn suffix(&mut self, suffix: &str, prim: Prim) -> &mut Self {
+        self.m.suffixes.push((suffix.into(), prim));
+        self
+    }
+
+    /// A prefix operator.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::OpKind;
+    /// use lower_lang::OpSpec;
+    ///
+    /// let mut b = lower_lang::MappingBuilder::<u8>::new();
+    /// b.prefix_op(1, OpSpec::Op(OpKind::Neg));
+    /// assert!(b.build().is_ok());
+    /// ```
+    pub fn prefix_op(&mut self, kind: K, spec: OpSpec) -> &mut Self {
+        self.m.prefix.push((kind, spec));
+        self
+    }
+
+    /// A binary operator.
+    ///
+    /// # Examples
+    ///
+    /// See [`MappingBuilder`].
+    pub fn binary_op(&mut self, kind: K, spec: OpSpec) -> &mut Self {
+        self.m.binary.push((kind, spec));
+        self
+    }
+
+    /// A postfix operator.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{templates, OpSpec};
+    ///
+    /// let mut b = lower_lang::MappingBuilder::<u8>::new();
+    /// let inc = b.template(templates::post_increment())?;
+    /// b.postfix_op(1, OpSpec::Template(inc));
+    /// assert!(b.build().is_ok());
+    /// # Ok::<(), lower_lang::MappingError>(())
+    /// ```
+    pub fn postfix_op(&mut self, kind: K, spec: OpSpec) -> &mut Self {
+        self.m.postfix.push((kind, spec));
+        self
+    }
+
+    /// Stores a host or intrinsic name for [`OpSpec::Extern`] and
+    /// [`OpSpec::Intrinsic`]; interned per lowering.
+    ///
+    /// # Examples
+    ///
+    /// See [`NameRef`].
+    pub fn name(&mut self, text: &str) -> NameRef {
+        NameRef(self.string(text))
+    }
+
+    fn string(&mut self, text: &str) -> u32 {
+        let i = self.m.strings.len();
+        self.m.strings.push(text.into());
+        u32::try_from(i).unwrap_or_else(|_| {
+            self.rule_picks_error = Some(MappingError::TooLarge);
+            0
+        })
+    }
+
+    /// Sets the language-wide policies.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::LangPolicy;
+    ///
+    /// let mut policy = LangPolicy::default();
+    /// policy.implicit_locals = true;
+    /// let mut b = lower_lang::MappingBuilder::<u8>::new();
+    /// b.policy(policy);
+    /// assert!(b.build()?.policy().implicit_locals);
+    /// # Ok::<(), lower_lang::MappingError>(())
+    /// ```
+    pub fn policy(&mut self, policy: LangPolicy) -> &mut Self {
+        self.m.policy = policy;
+        self
+    }
+
+    /// Registers a template and returns its id. Templates it
+    /// [`apply`](crate::TemplateBuilder::apply)s must already be registered,
+    /// which keeps templates acyclic by construction.
+    ///
+    /// # Errors
+    ///
+    /// [`MappingError::UnknownTemplate`] if an `apply` names a template not
+    /// registered before this one; [`MappingError::ApplyArgs`] if its
+    /// arguments do not match that template's holes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{templates, MappingBuilder};
+    ///
+    /// let mut b = MappingBuilder::<u8>::new();
+    /// let id = b.template(templates::while_loop())?;
+    /// assert_eq!(id.index(), 0);
+    /// # Ok::<(), lower_lang::MappingError>(())
+    /// ```
+    pub fn template(&mut self, mut template: Template) -> Result<TemplateId, MappingError> {
+        let index = self.m.templates.len();
+        for &node in &template.applies {
+            let Some(TNode::Apply {
+                template: callee,
+                args,
+            }) = template.node(node).copied()
+            else {
+                continue;
+            };
+            let callee_t =
+                self.m
+                    .templates
+                    .get(callee as usize)
+                    .ok_or(MappingError::UnknownTemplate {
+                        template: callee as usize,
+                    })?;
+            let (start, len) = (args.0 as usize, args.1 as usize);
+            let given = template
+                .args
+                .get(start..start.saturating_add(len))
+                .ok_or(MappingError::ApplyArgs { template: index })?;
+            if given.len() != callee_t.holes.len() {
+                return Err(MappingError::ApplyArgs { template: index });
+            }
+            for (arg, hole) in given.iter().zip(&callee_t.holes) {
+                let fits = match arg.kind() {
+                    Some(kind) => kind == hole.kind,
+                    None => hole.optional,
+                };
+                let forwarded_ok = match *arg {
+                    TArg::Stmts(h) => template
+                        .holes
+                        .get(usize::from(h.0))
+                        .is_some_and(|d| d.kind == HoleKind::Stmts),
+                    TArg::Args(h) => template
+                        .holes
+                        .get(usize::from(h.0))
+                        .is_some_and(|d| d.kind == HoleKind::Args),
+                    _ => true,
+                };
+                if !fits || !forwarded_ok {
+                    return Err(MappingError::ApplyArgs { template: index });
+                }
+            }
+        }
+        let id = u32::try_from(index).map_err(|_| MappingError::TooLarge)?;
+        let base = u32::try_from(self.m.strings.len()).map_err(|_| MappingError::TooLarge)?;
+        template.text_base = base;
+        self.m.strings.extend(template.texts.iter().cloned());
+        let name = template.name.clone();
+        let name_ref = self.string(&name);
+        self.m.template_names.push(name_ref);
+        self.m.templates.push(template);
+        Ok(TemplateId(id))
+    }
+
+    /// Nodes of `kind` lower through `template`, its holes filled from
+    /// `holes` (one pick per hole, in the template's hole order).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{templates, MappingBuilder, Pick};
+    ///
+    /// const WHILE: u8 = 1;
+    /// let mut b = MappingBuilder::new();
+    /// let w = b.template(templates::while_loop())?;
+    /// // `while COND BLOCK`: holes cond, body, label.
+    /// b.template_node(WHILE, w, &[Pick::NthNode(0), Pick::NthNode(1), Pick::Absent]);
+    /// assert!(b.build().is_ok());
+    /// # Ok::<(), lower_lang::MappingError>(())
+    /// ```
+    pub fn template_node(&mut self, kind: K, template: TemplateId, holes: &[Pick<K>]) -> &mut Self {
+        let first = self.m.hole_picks.len();
+        self.m.hole_picks.extend_from_slice(holes);
+        match (u32::try_from(first), u32::try_from(holes.len())) {
+            (Ok(first), Ok(len)) => self.add_rule(
+                kind,
+                Pick::Absent,
+                Arch::Template(TemplateUse {
+                    template,
+                    first,
+                    len,
+                }),
+            ),
+            _ => {
+                self.rule_picks_error = Some(MappingError::TooLarge);
+                self
+            }
+        }
+    }
+
+    /// Checks the mapping and returns it.
+    ///
+    /// # Errors
+    ///
+    /// A [`MappingError`]: a required field without a pick, a kind with two
+    /// entries in a one-entry table, an unknown template or a wrong number of
+    /// template picks, or an operator spec that cannot apply where it is
+    /// registered.
+    ///
+    /// # Examples
+    ///
+    /// See [`MappingBuilder`].
+    pub fn build(mut self) -> Result<Mapping<K>, MappingError> {
+        if let Some(e) = self.rule_picks_error {
+            return Err(e);
+        }
+        let m = &mut self.m;
+        for (i, rule) in m.rules.iter().enumerate() {
+            if let Some(field) = missing_field(&rule.arch) {
+                return Err(MappingError::MissingField { rule: i, field });
+            }
+            if let Arch::Template(used) = rule.arch {
+                let t = m.templates.get(used.template.index()).ok_or(
+                    MappingError::UnknownTemplate {
+                        template: used.template.index(),
+                    },
+                )?;
+                if t.holes.len() != used.len as usize {
+                    return Err(MappingError::HoleCount {
+                        rule: i,
+                        expected: t.holes.len(),
+                        found: used.len as usize,
+                    });
+                }
+            }
+        }
+        for (fixity, table) in [
+            (Fixity::Prefix, &m.prefix),
+            (Fixity::Binary, &m.binary),
+            (Fixity::Postfix, &m.postfix),
+        ] {
+            for (index, (_, spec)) in table.iter().enumerate() {
+                if !op_fits(*spec, fixity, &m.templates) {
+                    return Err(MappingError::BadOperator { fixity, index });
+                }
+            }
+        }
+        m.by_kind.sort_by_key(|e| e.0);
+        sort_unique(&mut m.roles, "token role")?;
+        sort_unique(&mut m.modifiers, "modifier")?;
+        sort_unique(&mut m.roots, "root")?;
+        sort_unique(&mut m.prefix, "prefix operator")?;
+        sort_unique(&mut m.binary, "binary operator")?;
+        sort_unique(&mut m.postfix, "postfix operator")?;
+        m.containers.sort();
+        m.containers.dedup();
+        m.skips.sort();
+        m.skips.dedup();
+        m.errors.sort();
+        m.errors.dedup();
+        let mut names: Vec<(usize, &str)> = m
+            .type_names
+            .iter()
+            .enumerate()
+            .map(|(i, (t, _))| (i, &**t))
+            .collect();
+        names.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(&b.0)));
+        if let Some(w) = names.windows(2).find(|w| w[0].1 == w[1].1) {
+            return Err(MappingError::DuplicateTypeName { index: w[1].0 });
+        }
+        m.type_names.sort_by(|a, b| a.0.cmp(&b.0));
+        // Longest suffix first, so `i64` wins over a hypothetical `4`.
+        m.suffixes
+            .sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.0.cmp(&b.0)));
+        Ok(self.m)
+    }
+}
+
+/// Sorts a kind-keyed table, refusing a kind with two entries (reported by
+/// the later entry's registration index).
+fn sort_unique<K: Ord + Copy, V>(
+    table: &mut [(K, V)],
+    name: &'static str,
+) -> Result<(), MappingError> {
+    let mut order: Vec<(K, usize)> = table
+        .iter()
+        .enumerate()
+        .map(|(i, (k, _))| (*k, i))
+        .collect();
+    order.sort();
+    if let Some(w) = order.windows(2).find(|w| w[0].0 == w[1].0) {
+        return Err(MappingError::DuplicateKind {
+            table: name,
+            index: w[1].1,
+        });
+    }
+    table.sort_by_key(|e| e.0);
+    Ok(())
+}
+
+/// Whether `spec` can apply at `fixity`.
+fn op_fits(spec: OpSpec, fixity: Fixity, templates: &[Template]) -> bool {
+    let arity = fixity.arity();
+    match spec {
+        OpSpec::Op(kind) => kind.arity() == arity,
+        OpSpec::OpWith(op) => op.kind.arity() == arity && op.policy_matches(),
+        OpSpec::Compound(kind) => fixity == Fixity::Binary && compound_ok(kind),
+        OpSpec::CompoundWith(op) => {
+            fixity == Fixity::Binary && compound_ok(op.kind) && op.policy_matches()
+        }
+        OpSpec::Assign | OpSpec::RefAssign => fixity == Fixity::Binary,
+        OpSpec::Identity | OpSpec::Await => fixity != Fixity::Binary,
+        OpSpec::Borrow(_) | OpSpec::Deref => fixity == Fixity::Prefix,
+        OpSpec::Template(id) => templates.get(id.index()).is_some_and(|t| {
+            t.holes.len() == arity && t.holes.iter().all(|h| h.kind == HoleKind::Expr)
+        }),
+        OpSpec::Extern(_) | OpSpec::Intrinsic(_) => true,
+    }
+}
+
+/// The first required field an archetype leaves `Absent`.
+fn missing_field<K>(arch: &Arch<K>) -> Option<&'static str> {
+    let need =
+        |pairs: &[(&'static str, bool)]| pairs.iter().find(|(_, absent)| *absent).map(|(f, _)| *f);
+    match arch {
+        Arch::Module { .. }
+        | Arch::Splice { .. }
+        | Arch::Unsupported
+        | Arch::GlobalDecl { .. }
+        | Arch::MixinUse { .. }
+        | Arch::FieldDecl { .. }
+        | Arch::Tuple { .. }
+        | Arch::Array { .. }
+        | Arch::Map { .. }
+        | Arch::RecordLit { .. }
+        | Arch::Block { .. }
+        | Arch::Break { .. }
+        | Arch::Continue { .. }
+        | Arch::Return { .. }
+        | Arch::Yield { .. }
+        | Arch::Template(_)
+        | Arch::WildPat
+        | Arch::RestPat { .. }
+        | Arch::TuplePat { .. }
+        | Arch::RecordPat { .. }
+        | Arch::OrPat { .. }
+        | Arch::RangePat { .. }
+        | Arch::SlicePat { .. }
+        | Arch::TupleTy { .. }
+        | Arch::FnTy { .. }
+        | Arch::ObjectTy { .. }
+        | Arch::ImplTy { .. } => None,
+        Arch::Pass { inner } => need(&[("inner", inner.is_absent())]),
+        Arch::Let { pat, .. } => need(&[("pat", pat.is_absent())]),
+        Arch::ExprStmt { expr } => need(&[("expr", expr.is_absent())]),
+        Arch::Defer { body } => need(&[("body", body.is_absent())]),
+        Arch::Static { name, .. }
+        | Arch::Fn { name, .. }
+        | Arch::Record { name, .. }
+        | Arch::Sum { name, .. }
+        | Arch::Interface { name, .. }
+        | Arch::Class { name, .. }
+        | Arch::AssocType { name, .. }
+        | Arch::Const { name, .. }
+        | Arch::GlobalVar { name, .. }
+        | Arch::VariantDecl { name, .. }
+        | Arch::GenericParam { name, .. }
+        | Arch::Capture { name }
+        | Arch::Segment { name, .. }
+        | Arch::BindPat { name, .. }
+        | Arch::FieldPat { name, .. }
+        | Arch::FieldInit { name, .. } => need(&[("name", name.is_absent())]),
+        Arch::Import { path, .. } => need(&[("path", path.is_absent())]),
+        Arch::Impl { self_ty, .. } => need(&[("self_ty", self_ty.is_absent())]),
+        Arch::Alias { name, ty, .. } | Arch::AssocBinding { name, ty } => {
+            need(&[("name", name.is_absent()), ("ty", ty.is_absent())])
+        }
+        Arch::WherePred { subject, .. } => need(&[("subject", subject.is_absent())]),
+        Arch::Param { pat, .. } => need(&[("pat", pat.is_absent())]),
+        Arch::Path {
+            segments, qself, ..
+        } => need(&[("segments", segments.is_absent() && qself.is_absent())]),
+        Arch::Unary { op, operand } | Arch::Postfix { operand, op } => {
+            need(&[("op", op.is_absent()), ("operand", operand.is_absent())])
+        }
+        Arch::Binary { lhs, op, rhs } => need(&[
+            ("lhs", lhs.is_absent()),
+            ("op", op.is_absent()),
+            ("rhs", rhs.is_absent()),
+        ]),
+        Arch::Assign { target, value, .. } => {
+            need(&[("target", target.is_absent()), ("value", value.is_absent())])
+        }
+        Arch::RefAssign { target, source } => need(&[
+            ("target", target.is_absent()),
+            ("source", source.is_absent()),
+        ]),
+        Arch::Call { callee, .. } => need(&[("callee", callee.is_absent())]),
+        Arch::Arg { value, .. } | Arch::MapEntry { value, .. } => {
+            need(&[("value", value.is_absent())])
+        }
+        Arch::Member { base, member, .. } => {
+            need(&[("base", base.is_absent()), ("member", member.is_absent())])
+        }
+        Arch::MethodCall {
+            receiver, method, ..
+        } => need(&[
+            ("receiver", receiver.is_absent()),
+            ("method", method.is_absent()),
+        ]),
+        Arch::DynMember { base, name, .. } => {
+            need(&[("base", base.is_absent()), ("name", name.is_absent())])
+        }
+        Arch::Index { base, index } => {
+            need(&[("base", base.is_absent()), ("index", index.is_absent())])
+        }
+        Arch::VarVar { inner }
+        | Arch::Deref { inner }
+        | Arch::Await { inner }
+        | Arch::Spawn { inner }
+        | Arch::RefPat { inner }
+        | Arch::PtrTy { inner }
+        | Arch::NullableTy { inner }
+        | Arch::RefTy { inner, .. } => need(&[("inner", inner.is_absent())]),
+        Arch::Append { base } => need(&[("base", base.is_absent())]),
+        Arch::Repeat { elem, count } => {
+            need(&[("elem", elem.is_absent()), ("count", count.is_absent())])
+        }
+        Arch::Cast { expr, ty } => need(&[("expr", expr.is_absent()), ("ty", ty.is_absent())]),
+        Arch::Borrow { expr } => need(&[("expr", expr.is_absent())]),
+        Arch::If { cond, then, .. } => {
+            need(&[("cond", cond.is_absent()), ("then", then.is_absent())])
+        }
+        Arch::Match { scrutinee, .. } => need(&[("scrutinee", scrutinee.is_absent())]),
+        Arch::Arm { pat, body, .. } => {
+            need(&[("pat", pat.is_absent()), ("body", body.is_absent())])
+        }
+        Arch::Loop { body, .. }
+        | Arch::Try { body, .. }
+        | Arch::Catch { body, .. }
+        | Arch::Closure { body, .. } => need(&[("body", body.is_absent())]),
+        Arch::Throw { value } => need(&[("value", value.is_absent())]),
+        Arch::CtorPat { path, .. } => need(&[("path", path.is_absent())]),
+        Arch::TypeTestPat { ty, .. } => need(&[("ty", ty.is_absent())]),
+        Arch::ArrayTy { elem, len } => {
+            need(&[("elem", elem.is_absent()), ("len", len.is_absent())])
+        }
+        Arch::SliceTy { elem } => need(&[("elem", elem.is_absent())]),
+    }
+}
+
+/// Every [`Modifier`] in bit order, for the scan of a node's children.
+pub(crate) fn modifier_bits<K: Ord>(map: &Mapping<K>, kind: &K) -> u32 {
+    find(&map.modifiers, kind).map_or(0, |m| m.bit())
+}
+
+#[cfg(test)]
+// Builder methods return `&mut Self` for chaining; the tests discard it.
+#[allow(unused_results)]
+mod tests {
+    use super::*;
+    use crate::templates;
+
+    #[test]
+    fn test_duplicate_roles_are_refused() {
+        let mut b = MappingBuilder::<u8>::new();
+        b.token(1, TokenRole::Name).token(1, TokenRole::Int);
+        assert_eq!(
+            b.build().err(),
+            Some(MappingError::DuplicateKind {
+                table: "token role",
+                index: 1
+            })
+        );
+    }
+
+    #[test]
+    fn test_operator_specs_are_checked_against_their_position() {
+        let mut b = MappingBuilder::<u8>::new();
+        b.binary_op(1, OpSpec::Op(OpKind::Neg));
+        assert!(matches!(b.build(), Err(MappingError::BadOperator { .. })));
+
+        let mut b = MappingBuilder::<u8>::new();
+        b.binary_op(1, OpSpec::Compound(OpKind::Eq));
+        assert!(matches!(b.build(), Err(MappingError::BadOperator { .. })));
+
+        let mut b = MappingBuilder::<u8>::new();
+        b.prefix_op(1, OpSpec::Assign);
+        assert!(matches!(b.build(), Err(MappingError::BadOperator { .. })));
+
+        let mut b = MappingBuilder::<u8>::new();
+        let w = b.template(templates::while_loop()).ok();
+        if let Some(w) = w {
+            b.binary_op(1, OpSpec::Template(w));
+        }
+        assert!(matches!(b.build(), Err(MappingError::BadOperator { .. })));
+    }
+
+    #[test]
+    fn test_template_node_checks_hole_count() {
+        let mut b = MappingBuilder::<u8>::new();
+        let Ok(w) = b.template(templates::while_loop()) else {
+            panic!("registers");
+        };
+        b.template_node(1, w, &[Pick::Nth(0)]);
+        assert_eq!(
+            b.build().err(),
+            Some(MappingError::HoleCount {
+                rule: 0,
+                expected: 3,
+                found: 1
+            })
+        );
+    }
+
+    #[test]
+    fn test_conditional_rules_keep_registration_order() {
+        let mut b = MappingBuilder::<u8>::new();
+        b.node(9, Arch::WildPat);
+        b.node_when(4, Pick::First(1), Arch::Unsupported);
+        b.node(4, Arch::WildPat);
+        let Ok(m) = b.build() else { panic!("valid") };
+        let (s, e) = m.rule_range(&4);
+        assert_eq!(e - s, 2);
+        assert_eq!(m.rule_for(&4), Some(&Arch::Unsupported));
+    }
+
+    #[test]
+    fn test_duplicate_type_names_are_refused() {
+        let mut b = MappingBuilder::<u8>::new();
+        b.type_name("int", TypeName::Any)
+            .type_name("int", TypeName::Never);
+        assert_eq!(
+            b.build().err(),
+            Some(MappingError::DuplicateTypeName { index: 1 })
+        );
+    }
+}
