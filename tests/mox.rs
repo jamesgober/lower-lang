@@ -12,11 +12,11 @@ mod common;
 mod mox;
 
 use hir_lang::{
-    ArgKind, BindMode, BinderKind, CaptureMode, Effects, ExpnKind, Expr, Hir, IdKind, ItemKind,
-    Lit, NodeRef, Ns, ParamKind, Pat, Res, Stmt,
+    ArgKind, AttrValue, BindMode, BinderKind, CaptureMode, Effects, ExpnKind, Expr, Hir, IdKind,
+    ItemKind, Lit, MixinAction, NodeRef, Ns, ParamKind, Pat, Res, Stmt,
 };
 use intern_lang::Interner;
-use lower_lang::Lowered;
+use lower_lang::{Lowered, ProblemKind};
 use mox::{M, W, mox_mapping};
 
 fn lower(w: W) -> (Lowered, Interner, String) {
@@ -95,15 +95,27 @@ fn test_foreach_template_is_hygienic() {
     let hir = out.hir;
 
     // Two template expansions: foreach, and echo nested in its body (a
-    // separate instantiation in user code, so its parent is the root).
+    // separate instantiation in user code, so its parent is the root); and,
+    // under PHP scoping, one `hoist` desugaring per function-scoped binding
+    // (`$k`, `$v`), whose temporaries no user name can capture.
     let expns: Vec<_> = (1..=hir.count(IdKind::Expansion) as u32)
         .filter_map(|i| hir.expansion(hir_lang::ExpnId::from_u32(i)).copied())
         .collect();
-    assert_eq!(expns.len(), 2);
+    assert_eq!(expns.len(), 4);
     assert!(expns.iter().all(|e| e.parent.is_root()));
     let mut kinds: Vec<ExpnKind> = expns.iter().map(|e| e.kind).collect();
     kinds.sort_by_key(|k| *k as u8);
-    assert_eq!(kinds, [ExpnKind::Template, ExpnKind::Desugar]);
+    assert_eq!(
+        kinds,
+        [
+            ExpnKind::Template,
+            ExpnKind::Desugar,
+            ExpnKind::Desugar,
+            ExpnKind::Desugar
+        ]
+    );
+    let hoist = names.intern("hoist");
+    assert_eq!(expns.iter().filter(|e| e.name == hoist).count(), 2);
 
     // The template's `it` carries the foreach expansion's mark; the user's
     // `$it` (implicitly declared) does not.
@@ -643,4 +655,599 @@ fn test_mox_namespaces_and_path_shapes() {
         assert_eq!(p.ns, Ns::Value);
         assert!(p.res.is_unresolved());
     }
+}
+
+// ------------------------------------------------------------- 0.3: PHP
+
+/// `"..."` with the given pieces: `Ok(text)` a `StrPart`, `Err(var)` a
+/// `$var`, braced when `braced`.
+fn dq(w: &mut W, pieces: &[Result<&str, &str>], braced: bool) {
+    w.open(M::DqString).t(M::DQuote, "\"");
+    for p in pieces {
+        match p {
+            Ok(text) => {
+                w.t(M::StrPart, text);
+            }
+            Err(var) => {
+                if braced {
+                    w.t(M::CurlyOpen, "{");
+                }
+                w.var(var);
+                if braced {
+                    w.t(M::CurlyClose, "}");
+                }
+            }
+        }
+    }
+    w.t(M::DQuote, "\"").close();
+}
+
+/// Lowers and prints.
+fn printed(w: W) -> (Lowered, String) {
+    let (out, names, _) = lower(w);
+    let p = hir_lang::print(&out.hir, &names);
+    (out, p)
+}
+
+/// The text of every string literal, in walk order.
+fn strings(hir: &Hir) -> Vec<String> {
+    exprs(hir)
+        .into_iter()
+        .filter_map(|e| match e {
+            Expr::Lit(Lit::Str(t)) => Some(hir.str(t).to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn test_interpolated_strings_join_with_concat() {
+    // $s = "Hello {$name}!";  $t = "$name";  $u = "{$a['k']}";  $v = "plain\n";  $w = "";
+    let mut w = W::new();
+    w.open(M::File);
+    assign(&mut w, "s", |w| {
+        dq(w, &[Ok("Hello "), Err("name"), Ok("!")], true);
+    });
+    assign(&mut w, "t", |w| dq(w, &[Err("name")], false));
+    assign(&mut w, "u", |w| {
+        w.open(M::DqString)
+            .t(M::DQuote, "\"")
+            .t(M::CurlyOpen, "{")
+            .open(M::Index)
+            .var("a")
+            .t(M::LBracket, "[")
+            .t(M::SqStr, "'k'")
+            .t(M::RBracket, "]")
+            .close()
+            .t(M::CurlyClose, "}")
+            .t(M::DQuote, "\"")
+            .close();
+    });
+    assign(&mut w, "v", |w| dq(w, &[Ok("pla"), Ok("in\\n")], false));
+    assign(&mut w, "w", |w| dq(w, &[], false));
+    w.close();
+    let (out, p) = printed(w);
+    assert!(out.problems.is_empty(), "{:?}", out.problems);
+    // "Hello {$name}!": concat(concat("Hello ", name), "!").
+    let hello = [
+        "(call",
+        "          (use (path mox.concat → extern mox.concat))",
+        "          (call",
+        "            (use (path mox.concat → extern mox.concat))",
+        "            (lit \"Hello \")",
+        "            (use (path name)))",
+        "          (lit \"!\"))",
+    ]
+    .join("\n");
+    assert!(p.contains(&hello), "{p}");
+    // "$name": a conversion, concat("", name).
+    assert!(p.contains("(lit \"\")\n          (use (path name))"), "{p}");
+    // "{$a['k']}": the embedded index expression.
+    assert!(
+        p.contains("(index\n            (use (path a))\n            (lit \"k\"))"),
+        "{p}"
+    );
+    // Adjacent text pieces merge, escapes decoded; "" is the empty string.
+    let texts = strings(&out.hir);
+    assert!(texts.contains(&"plain\n".to_owned()), "{texts:?}");
+    assert_eq!(
+        texts.iter().filter(|t| t.is_empty()).count(),
+        3,
+        "{texts:?}"
+    );
+}
+
+#[test]
+fn test_heredoc_indentation_is_stripped_per_php_7_3() {
+    // $h = <<<EOT
+    //     Hi {$x}
+    //       indented
+    //     EOT;
+    let mut w = W::new();
+    w.open(M::File);
+    assign(&mut w, "h", |w| {
+        w.open(M::HeredocStr)
+            .t(M::HeredocOpen, "<<<EOT\n")
+            .t(M::StrPart, "    Hi ")
+            .t(M::CurlyOpen, "{")
+            .var("x")
+            .t(M::CurlyClose, "}")
+            .t(M::StrPart, "\n      indented\n")
+            .t(M::HeredocClose, "    EOT")
+            .close();
+    });
+    // A body line indented less than the closing marker is reported.
+    assign(&mut w, "bad", |w| {
+        w.open(M::HeredocStr)
+            .t(M::HeredocOpen, "<<<EOT\n")
+            .t(M::StrPart, "  short\n")
+            .t(M::HeredocClose, "    EOT")
+            .close();
+    });
+    // So is a line that starts with an expression (no indentation at all).
+    assign(&mut w, "bad2", |w| {
+        w.open(M::HeredocStr)
+            .t(M::HeredocOpen, "<<<EOT\n")
+            .t(M::StrPart, "    ok\n")
+            .t(M::CurlyOpen, "{")
+            .var("x")
+            .t(M::CurlyClose, "}")
+            .t(M::StrPart, "\n")
+            .t(M::HeredocClose, "    EOT")
+            .close();
+    });
+    // A nowdoc token: no escapes, indentation stripped (blank lines kept),
+    // the last newline dropped.
+    assign(&mut w, "n", |w| {
+        w.t(M::Nowdoc, "<<<'EOT'\n  raw \\n {$x}\n\n   two\n  EOT");
+    });
+    w.close();
+    let (out, p) = printed(w);
+    let texts = strings(&out.hir);
+    assert!(texts.contains(&"Hi ".to_owned()), "{texts:?}\n{p}");
+    assert!(texts.contains(&"\n  indented".to_owned()), "{texts:?}");
+    assert!(
+        texts.contains(&"raw \\n {$x}\n\n two".to_owned()),
+        "{texts:?}"
+    );
+    // The empty piece after `{$x}` (only the dropped final newline) is not
+    // joined.
+    assert!(!texts.contains(&String::new()), "{texts:?}\n{p}");
+    assert_eq!(
+        out.problems
+            .iter()
+            .filter(|p| p.kind == ProblemKind::InvalidLiteral)
+            .count(),
+        2,
+        "{:?}",
+        out.problems
+    );
+}
+
+#[test]
+fn test_foreach_and_catch_variables_are_function_scoped() {
+    // function f($items) {
+    //   foreach ($items as $k => $v) { }
+    //   try { } catch (Ex $e) { }
+    //   echo $k, $v, $e;
+    // }
+    let mut w = W::new();
+    w.open(M::File);
+    func(
+        &mut w,
+        "f",
+        |w| {
+            w.open(M::Param).var("items").close();
+        },
+        |w| {
+            w.open(M::Foreach)
+                .t(M::ForeachKw, "foreach")
+                .t(M::LParen, "(")
+                .var("items")
+                .t(M::As, "as");
+            w.var("k").t(M::FatArrow, "=>").var("v").t(M::RParen, ")");
+            block(w, |_| {});
+            w.close();
+            w.open(M::ExprStmt).open(M::Try).t(M::TryKw, "try");
+            block(w, |_| {});
+            w.open(M::Catch)
+                .t(M::CatchKw, "catch")
+                .t(M::LParen, "(")
+                .t(M::Ident, "Ex")
+                .var("e")
+                .t(M::RParen, ")");
+            block(w, |_| {});
+            w.close().close().t(M::Semi, ";").close();
+            w.open(M::Echo)
+                .t(M::EchoKw, "echo")
+                .var("k")
+                .t(M::Comma, ",")
+                .var("v")
+                .t(M::Comma, ",")
+                .var("e")
+                .t(M::Semi, ";")
+                .close();
+        },
+    );
+    w.close();
+    let (out, names, _) = lower(w);
+    assert!(out.problems.is_empty(), "{:?}", out.problems);
+    let mut hir = out.hir;
+    // The function body starts with the hoisted `let k; let v; let e;`.
+    let ItemKind::Module { items, .. } = hir.item(hir.root()).kind else {
+        panic!()
+    };
+    let ItemKind::Fn(def) = hir.item(hir.list(items)[0]).kind else {
+        panic!()
+    };
+    let Expr::Block(body) = *hir.expr(def.body.unwrap()) else {
+        panic!("wrapped in the hoisted declarations")
+    };
+    let hoisted: Vec<String> = hir
+        .list(body.stmts)
+        .iter()
+        .filter_map(|s| match *hir.stmt(*s) {
+            Stmt::Let { pat, .. } => match *hir.pat(pat) {
+                Pat::Bind { binder, .. } => names
+                    .resolve(hir.binder(binder).unwrap().name.sym)
+                    .map(str::to_owned),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hoisted, ["k", "v", "e"]);
+    // After the loop and the handler, `$k`, `$v`, `$e` resolve to those
+    // function-scoped binders (the pattern temporaries are marked, so no
+    // name reaches them).
+    let (resolved, open) = common::resolve_locals(&mut hir);
+    assert_eq!(open, 0, "every local resolves");
+    assert!(resolved >= 7, "{resolved}");
+    let p = hir_lang::print(&hir, &names);
+    assert!(p.contains("(path k → local k%"), "{p}");
+    for i in 0..hir.count(IdKind::Path) {
+        let path = *hir.path(hir_lang::PathId::from_index(i).unwrap());
+        if let Res::Local(b) = path.res {
+            assert_eq!(
+                hir.binder(b).unwrap().name.mark,
+                hir.list(path.segments)[0].name.mark,
+                "hygiene"
+            );
+        }
+    }
+    // The echo after the loop reads the hoisted binders.
+    let hoisted_binders: Vec<hir_lang::BinderId> = hir
+        .list(body.stmts)
+        .iter()
+        .filter_map(|s| match *hir.stmt(*s) {
+            Stmt::Let { pat, .. } => match *hir.pat(pat) {
+                Pat::Bind { binder, .. } => Some(binder),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let reads = (0..hir.count(IdKind::Path))
+        .filter(|&i| {
+            matches!(
+                hir.path(hir_lang::PathId::from_index(i).unwrap()).res,
+                Res::Local(b) if hoisted_binders.contains(&b)
+            )
+        })
+        .count();
+    // Three assignments (k, v, e) plus three reads in the echo.
+    assert_eq!(reads, 6, "{p}");
+}
+
+#[test]
+fn test_trait_insteadof_and_as_rules() {
+    // class C { use A, B { A::hi insteadof B; B::hi as protected greet; hi as private; ho; } }
+    let mut w = W::new();
+    w.open(M::File)
+        .open(M::Class)
+        .t(M::ClassKw, "class")
+        .t(M::Ident, "C")
+        .t(M::LBrace, "{");
+    w.open(M::MixinUse)
+        .t(M::UseKw, "use")
+        .t(M::Ident, "A")
+        .t(M::Comma, ",")
+        .t(M::Ident, "B")
+        .t(M::LBrace, "{");
+    w.open(M::TraitRule)
+        .t(M::Ident, "A")
+        .t(M::ColonColon, "::")
+        .t(M::Ident, "hi")
+        .t(M::InsteadofKw, "insteadof")
+        .t(M::Ident, "B")
+        .t(M::Semi, ";")
+        .close();
+    w.open(M::TraitRule)
+        .t(M::Ident, "B")
+        .t(M::ColonColon, "::")
+        .t(M::Ident, "hi")
+        .t(M::As, "as")
+        .t(M::Protected, "protected")
+        .t(M::Ident, "greet")
+        .t(M::Semi, ";")
+        .close();
+    w.open(M::TraitRule)
+        .t(M::Ident, "hi")
+        .t(M::As, "as")
+        .t(M::Private, "private")
+        .t(M::Semi, ";")
+        .close();
+    w.open(M::TraitRule)
+        .t(M::Ident, "ho")
+        .t(M::Semi, ";")
+        .close();
+    w.t(M::RBrace, "}").close();
+    w.t(M::RBrace, "}").close().close();
+    let (out, mut names, _) = lower(w);
+    let missing: Vec<_> = out
+        .problems
+        .iter()
+        .filter(|p| p.kind == ProblemKind::MissingField { field: "action" })
+        .collect();
+    assert_eq!(missing.len(), 1, "`ho;` has no action: {:?}", out.problems);
+    let hir = &out.hir;
+    let use_item = (0..hir.count(IdKind::Item))
+        .map(|i| hir.item(hir_lang::ItemId::from_index(i).unwrap()))
+        .find_map(|it| match it.kind {
+            ItemKind::MixinUse(def) => Some(def),
+            _ => None,
+        })
+        .expect("a mixin use");
+    assert_eq!(hir.list(use_item.mixins).len(), 2);
+    let rules = hir.list(use_item.rules);
+    assert_eq!(rules.len(), 3);
+    let hi = names.intern("hi");
+    assert!(rules.iter().all(|r| r.method.sym == hi));
+    assert!(matches!(rules[0].action, MixinAction::Insteadof(l) if l.len() == 1));
+    assert!(rules[0].from.is_some());
+    let greet = names.intern("greet");
+    assert!(matches!(
+        rules[1].action,
+        MixinAction::Alias { name: Some(n), vis: Some(hir_lang::Vis::Protected) } if n.sym == greet
+    ));
+    assert!(matches!(
+        rules[2].action,
+        MixinAction::Alias {
+            name: None,
+            vis: Some(hir_lang::Vis::Private)
+        }
+    ));
+    assert!(rules[2].from.is_none());
+}
+
+/// An `NsName` path node of `\`-separated names.
+fn ns_name(w: &mut W, parts: &[&str]) {
+    w.open(M::NsName);
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            w.t(M::NsSep, "\\");
+        }
+        w.t(M::Ident, p);
+    }
+    w.close();
+}
+
+#[test]
+fn test_group_use_flattens_to_one_import_per_leaf() {
+    // use App\Models\{User, Post as P, Sub\{X, Y}};   use Lone;
+    let mut w = W::new();
+    w.open(M::File);
+    w.open(M::UseStmt).t(M::UseKw, "use").open(M::UseDecl);
+    ns_name(&mut w, &["App", "Models"]);
+    w.t(M::NsSep, "\\").open(M::UseGroup).t(M::UseOpen, "{");
+    w.open(M::UseDecl)
+        .t(M::Ident, "User")
+        .close()
+        .t(M::Comma, ",");
+    w.open(M::UseDecl)
+        .t(M::Ident, "Post")
+        .t(M::As, "as")
+        .t(M::Ident, "P")
+        .close()
+        .t(M::Comma, ",");
+    w.open(M::UseDecl)
+        .t(M::Ident, "Sub")
+        .t(M::NsSep, "\\")
+        .open(M::UseGroup)
+        .t(M::UseOpen, "{");
+    w.open(M::UseDecl).t(M::Ident, "X").close().t(M::Comma, ",");
+    w.open(M::UseDecl).t(M::Ident, "Y").close();
+    w.t(M::UseClose, "}").close().close();
+    w.t(M::UseClose, "}")
+        .close()
+        .close()
+        .t(M::Semi, ";")
+        .close();
+    w.open(M::UseStmt).t(M::UseKw, "use").open(M::UseDecl);
+    w.t(M::Ident, "Lone").close().t(M::Semi, ";").close();
+    w.close();
+    let (out, names, _) = lower(w);
+    assert!(out.problems.is_empty(), "{:?}", out.problems);
+    let hir = &out.hir;
+    let ItemKind::Module { items, .. } = hir.item(hir.root()).kind else {
+        panic!()
+    };
+    let imports: Vec<(String, Option<String>)> = hir
+        .list(items)
+        .iter()
+        .filter_map(|&i| {
+            let it = hir.item(i);
+            let ItemKind::Import { path, glob } = it.kind else {
+                return None;
+            };
+            assert!(!glob);
+            let p = hir.path(path);
+            assert_eq!(p.ns, Ns::Import);
+            let segs: Vec<&str> = hir
+                .list(p.segments)
+                .iter()
+                .map(|s| names.resolve(s.name.sym).unwrap())
+                .collect();
+            Some((
+                segs.join("::"),
+                it.name.map(|n| names.resolve(n.sym).unwrap().to_owned()),
+            ))
+        })
+        .collect();
+    assert_eq!(
+        imports,
+        [
+            ("App::Models::User".to_owned(), None),
+            ("App::Models::Post".to_owned(), Some("P".to_owned())),
+            ("App::Models::Sub::X".to_owned(), None),
+            ("App::Models::Sub::Y".to_owned(), None),
+            ("Lone".to_owned(), None),
+        ]
+    );
+}
+
+#[test]
+fn test_attributes_lower_to_hir_attributes() {
+    // #[Route("/x", methods: GET), Pure] function f(#[Sensitive] $p) {}
+    // #[Bad([1])] function g() {}
+    let mut w = W::new();
+    w.open(M::File);
+    w.open(M::FnDecl);
+    w.open(M::AttrGroup).t(M::HashBracket, "#[");
+    w.open(M::Attr)
+        .t(M::Ident, "Route")
+        .t(M::LParen, "(")
+        .t(M::Str, "\"/x\"")
+        .t(M::Comma, ",")
+        .open(M::AttrArg)
+        .t(M::Ident, "methods")
+        .t(M::Colon, ":")
+        .t(M::Ident, "GET")
+        .close()
+        .t(M::RParen, ")")
+        .close()
+        .t(M::Comma, ",");
+    w.open(M::Attr).t(M::Ident, "Pure").close();
+    w.t(M::RBracket, "]").close();
+    w.t(M::Function, "function")
+        .t(M::Ident, "f")
+        .t(M::LParen, "(");
+    w.open(M::Params).open(M::Param);
+    w.open(M::AttrGroup).t(M::HashBracket, "#[");
+    w.open(M::Attr).t(M::Ident, "Sensitive").close();
+    w.t(M::RBracket, "]").close();
+    w.var("p").close().close();
+    w.t(M::RParen, ")");
+    block(&mut w, |_| {});
+    w.close();
+    w.open(M::FnDecl);
+    w.open(M::AttrGroup).t(M::HashBracket, "#[");
+    w.open(M::Attr)
+        .t(M::Ident, "Bad")
+        .t(M::LParen, "(")
+        .open(M::Array)
+        .t(M::LBracket, "[")
+        .t(M::Num, "1")
+        .t(M::RBracket, "]")
+        .close()
+        .t(M::RParen, ")")
+        .close();
+    w.t(M::RBracket, "]").close();
+    w.t(M::Function, "function")
+        .t(M::Ident, "g")
+        .t(M::LParen, "(");
+    w.open(M::Params).close();
+    w.t(M::RParen, ")");
+    block(&mut w, |_| {});
+    w.close();
+    w.close();
+    let (out, mut names, _) = lower(w);
+    assert_eq!(
+        out.problems.iter().map(|p| p.kind).collect::<Vec<_>>(),
+        [ProblemKind::AttributeArgument],
+        "{:?}",
+        out.problems
+    );
+    let hir = &out.hir;
+    let ItemKind::Module { items, .. } = hir.item(hir.root()).kind else {
+        panic!()
+    };
+    let f = hir.list(items)[0];
+    let attrs = hir.attrs(NodeRef::Item(f));
+    assert_eq!(attrs.len(), 2);
+    assert_eq!(attrs[0].name.sym, names.intern("Route"));
+    let args = hir.list(attrs[0].args);
+    assert_eq!(args.len(), 2);
+    assert!(matches!(args[0].value, Some(AttrValue::Lit(Lit::Str(t))) if hir.str(t) == "/x"));
+    assert_eq!(args[1].key.map(|k| k.sym), Some(names.intern("methods")));
+    let get = names.intern("GET");
+    assert!(matches!(args[1].value, Some(AttrValue::Name(n)) if n.sym == get));
+    assert_eq!(attrs[1].name.sym, names.intern("Pure"));
+    // The parameter's attribute.
+    let ItemKind::Fn(def) = hir.item(f).kind else {
+        panic!()
+    };
+    let param = hir.list(def.params)[0];
+    let pattrs = hir.attrs(NodeRef::Param(param));
+    assert_eq!(pattrs.len(), 1);
+    assert_eq!(pattrs[0].name.sym, names.intern("Sensitive"));
+    // `Bad([1])` keeps its name and drops the array argument.
+    let g = hir.list(items)[1];
+    let gattrs = hir.attrs(NodeRef::Item(g));
+    assert_eq!(gattrs.len(), 1);
+    assert!(hir.list(gattrs[0].args).is_empty());
+}
+
+#[test]
+fn test_php_number_literals() {
+    // PHP spelling: 1_000, 0777 (octal), 9223372036854775808 (float),
+    // 0xFFFFFFFFFFFFFFFF (float), PHP_INT_MAX (int); invalid: 1__0, 08,
+    // 0x1.8p3 (PHP has no hex floats).
+    let mut w = W::new();
+    w.open(M::File);
+    for (i, text) in [
+        "1_000",
+        "0777",
+        "9223372036854775808",
+        "0xFFFFFFFFFFFFFFFF",
+        "9223372036854775807",
+        "1__0",
+        "08",
+        "0x1.8p3",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assign(&mut w, &format!("n{i}"), |w| {
+            w.t(M::Num, text);
+        });
+    }
+    w.close();
+    let (out, _, _) = lower(w);
+    let lits: Vec<Lit> = exprs(&out.hir)
+        .into_iter()
+        .filter_map(|e| match e {
+            Expr::Lit(l) => Some(l),
+            _ => None,
+        })
+        .collect();
+    let int = |l: &Lit| match l {
+        Lit::Int(i) => Some(i.value),
+        _ => None,
+    };
+    let float = |l: &Lit| match l {
+        Lit::Float(f) => Some(f.value()),
+        _ => None,
+    };
+    assert_eq!(int(&lits[0]), Some(1000));
+    assert_eq!(int(&lits[1]), Some(511));
+    assert_eq!(float(&lits[2]), Some(9_223_372_036_854_775_808.0));
+    assert_eq!(float(&lits[3]), Some(18_446_744_073_709_551_616.0));
+    assert_eq!(int(&lits[4]), Some(i64::MAX as u64));
+    let bad = out
+        .problems
+        .iter()
+        .filter(|p| p.kind == ProblemKind::InvalidLiteral)
+        .count();
+    assert_eq!(bad, 3, "{:?}", out.problems);
 }

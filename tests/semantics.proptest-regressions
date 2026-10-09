@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b7b8bcd95d584b89d76c086dc9d20636c007d21f34c129a327e33ef39ca5a45b # shrinks to t = UT { prefix: [0], children: Some([UT { prefix: [0], children: Some([]), alias: None }]), alias: None }

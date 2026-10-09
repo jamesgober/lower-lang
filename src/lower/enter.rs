@@ -3,15 +3,18 @@
 
 use alloc::vec::Vec;
 
-use hir_lang::{BinderKind, CaptureMode, Effects, Name, Ns, Pat, PathRoot, Span};
+use hir_lang::{
+    BinderKind, CaptureMode, Effects, Item, ItemKind, Name, Ns, Origin, Pat, Path, PathRoot,
+    Segment, Span,
+};
 use intern_lang::Symbol;
 use syntax_lang::{Element, Node, TokenKind};
 
-use super::{Build, Frame, PatSite, Run, Task, Val, Want};
+use super::{Build, Frame, PatSite, Piece, Run, Slot, Task, Val, Want};
 use crate::arch::Arch;
-use crate::mapping::{Fixity, Modifier, OpSpec, TokenRole};
+use crate::mapping::{Escapes, Fixity, Modifier, OpSpec, TokenRole};
 use crate::pick::{self, Pick};
-use crate::problem::ProblemKind;
+use crate::problem::{HoistBlocker, ProblemKind};
 use crate::template::{HoleKind, TemplateId};
 
 /// Whether a context takes a pattern, and with which binder site.
@@ -23,6 +26,7 @@ pub(crate) const fn site_of(want: Want) -> Option<PatSite> {
             mutable: false,
             arm: false,
             bound: false,
+            persist: false,
         }),
         _ => None,
     }
@@ -98,7 +102,7 @@ where
         frame.vals_base = self.vals.len();
         frame.spill_base = self.spill.len();
         self.counts.push(1);
-        self.frames.push(frame);
+        self.open(frame);
         self.tasks.push(Task::Finish);
         self.tasks.push(Task::Node(node, inner));
     }
@@ -196,12 +200,16 @@ where
                         };
                         return self.plan(f, &[(init, Want::Expr, false)]);
                     }
+                    // Any other pattern binds temporaries that are assigned
+                    // to the hoisted names after it matches.
+                    f.aux = (u32::try_from(self.persist.len()).unwrap_or(u32::MAX), 1);
                 }
                 let site = PatSite {
                     param: false,
                     mutable: mutable || has(f.mods, Modifier::Mut),
                     arm: false,
                     bound: false,
+                    persist: hoist,
                 };
                 self.plan(
                     f,
@@ -239,6 +247,12 @@ where
                     return self.not_here(want, span);
                 }
                 self.global_decl(names, span);
+            }
+            Arch::UseTree { .. } => {
+                if !item_ok {
+                    return self.not_here(want, span);
+                }
+                self.use_tree(node, f.mods, span);
             }
             Arch::Import { path, alias } => {
                 if !item_ok {
@@ -401,11 +415,32 @@ where
                 f.name = Some(self.req_name(name, span));
                 self.plan(f, &[(ty, Want::Ty, false), (init, Want::Expr, false)]);
             }
-            Arch::MixinUse { mixins } => {
+            Arch::MixinUse { mixins, rules } => {
                 if want != Want::Member {
                     return self.not_here(want, span);
                 }
-                self.plan(f, &[(mixins, Want::Ty, true)]);
+                self.plan(f, &[(mixins, Want::Ty, true), (rules, Want::Rule, true)]);
+            }
+            Arch::MixinRule {
+                from,
+                method,
+                insteadof,
+                alias,
+            } => {
+                if want != Want::Rule {
+                    return self.not_here(want, span);
+                }
+                let m = self.req_name(method, span);
+                f.name = Some(m);
+                f.alias = self.opt_name(alias);
+                self.plan(f, &[(from, Want::Ty, false), (insteadof, Want::Ty, true)]);
+            }
+            Arch::Attr { .. } | Arch::AttrArg { .. } => self.not_here(want, span),
+            Arch::Interp { parts, close, .. } => {
+                if !expr_ok {
+                    return self.not_here(want, span);
+                }
+                self.enter_interp(f, parts, close);
             }
             Arch::FieldDecl { name, ty, default } => {
                 if !matches!(want, Want::Field | Want::Member) {
@@ -475,6 +510,7 @@ where
                     mutable: has(f.mods, Modifier::Mut),
                     arm: false,
                     bound: false,
+                    persist: false,
                 };
                 self.plan(
                     f,
@@ -546,7 +582,7 @@ where
                 }
                 if !op.is_absent() {
                     match self.pick1(op) {
-                        Some(Element::Token(t)) => match self.m.op(Fixity::Binary, t.kind()) {
+                        Some(Element::Token(t)) => match self.op_of(Fixity::Binary, t) {
                             Some(
                                 spec @ (OpSpec::Compound(_)
                                 | OpSpec::CompoundWith(_)
@@ -948,7 +984,17 @@ where
                 let Some(site) = site else {
                     return self.not_here(want, span);
                 };
-                let site = pmut(site, f.mods);
+                let mut site = pmut(site, f.mods);
+                if site.persist && has(f.mods, Modifier::Ref) {
+                    // Hoisting assigns a copy; a reference would not alias.
+                    self.report(
+                        ProblemKind::CannotHoist {
+                            reason: HoistBlocker::ByReference,
+                        },
+                        span,
+                    );
+                    site.persist = false;
+                }
                 let (sym, nspan) = self.req_name(name, span);
                 f.binder = Some(self.pat_binder(sym, nspan, site));
                 self.plan(f, &[(sub, Want::Pat(site), false)]);
@@ -1215,7 +1261,7 @@ where
         f.nfields = 3;
         f.vals_base = self.vals.len();
         f.spill_base = self.spill.len();
-        self.frames.push(f);
+        self.open(f);
         self.tasks.push(Task::Finish);
         for &e in rest.iter().rev() {
             self.tasks.push(Task::Elem(e, Want::Segment));
@@ -1243,7 +1289,7 @@ where
             Some(Element::Token(t)) => Some(t),
             _ => None,
         };
-        let spec = tok.and_then(|t| self.m.op(fixity, t.kind()));
+        let spec = tok.and_then(|t| self.op_of(fixity, t));
         // `-1` in a pattern.
         if let Some(site) = site_of(want) {
             let _ = site;
@@ -1323,11 +1369,21 @@ where
         let mut fields = core::mem::take(&mut self.tfields);
         fields.clear();
         let mut label = None;
+        // PHP scoping: a pattern hole's bindings belong to the function.
+        let persist = self.m.policy.function_scoped_bindings;
+        let pat_site = PatSite {
+            persist,
+            ..PatSite::LOCAL
+        };
+        let mut any_pat = false;
         for (i, hole) in t.holes.iter().enumerate() {
             let p = picks.get(i).copied().unwrap_or(Pick::Absent);
             match hole.kind {
                 HoleKind::Expr => fields.push((p, Want::Expr, false)),
-                HoleKind::Pat => fields.push((p, Want::Pat(PatSite::LOCAL), false)),
+                HoleKind::Pat => {
+                    any_pat = true;
+                    fields.push((p, Want::Pat(pat_site), false));
+                }
                 HoleKind::Ty => fields.push((p, Want::Ty, false)),
                 HoleKind::Stmts => fields.push((p, Want::Stmt, true)),
                 HoleKind::Args => fields.push((p, Want::Arg, true)),
@@ -1344,8 +1400,339 @@ where
             label,
             nodes_at: self.nodes,
         };
-        self.plan(f, &fields);
+        if persist && any_pat {
+            f.flag = true;
+            self.plan_marked(f, &fields);
+        } else {
+            self.plan(f, &fields);
+        }
         self.tfields = fields;
+    }
+
+    /// The operator spec of a token: its kind's entry, else its text's.
+    pub(crate) fn op_of(&mut self, fixity: Fixity, t: &'t syntax_lang::Token<K>) -> Option<OpSpec> {
+        let text = if self.m.has_op_text() {
+            self.text_of(t.span())
+        } else {
+            ""
+        };
+        self.m.op(fixity, t.kind(), text)
+    }
+
+    // ------------------------------------------------------------ use trees
+
+    /// The segments an element spells, appended to `segs`: a name, a path
+    /// node's segments (generic arguments are not part of an import), or a
+    /// root token. Leading root tokens set `root` when `root_ok`; a root
+    /// token elsewhere is reported. Returns whether the element was only a
+    /// `self` (`SelfModule`) root.
+    fn read_segments(
+        &mut self,
+        elem: &'t Element<K>,
+        segs: &mut Vec<Segment>,
+        root: &mut PathRoot,
+        root_ok: bool,
+    ) -> bool {
+        let mut parts: Vec<&'t Element<K>> = Vec::new();
+        match elem {
+            Element::Token(_) => parts.push(elem),
+            Element::Node(n) => match self.m.rule_for(n.kind()).copied() {
+                Some(Arch::Path { segments, .. }) => {
+                    let mut kids = Vec::new();
+                    pick::collect_kids(n, self.labeler, self.m, &mut kids, None);
+                    pick::list(segments, &kids, self.m, &mut parts);
+                }
+                _ => parts.push(elem),
+            },
+        }
+        let mut only_self = !parts.is_empty();
+        let mut leading = true;
+        for e in parts {
+            if let Element::Token(t) = e {
+                if let Some(r) = self.m.root_for(t.kind()) {
+                    if leading && root_ok {
+                        *root = match (*root, r) {
+                            (PathRoot::Super(n), PathRoot::Super(m)) => {
+                                PathRoot::Super(n.saturating_add(m))
+                            }
+                            (_, r) => r,
+                        };
+                        continue;
+                    }
+                    if leading && r == PathRoot::SelfModule {
+                        continue;
+                    }
+                    self.report(
+                        ProblemKind::NotAllowedHere {
+                            expected: crate::Context::Segment,
+                        },
+                        t.span(),
+                    );
+                    continue;
+                }
+            }
+            leading = false;
+            only_self = false;
+            match self.name_of(e) {
+                Some((sym, span)) => segs.push(Segment::new(Name::new(sym), Origin::new(span))),
+                None => self.report(ProblemKind::MissingField { field: "segment" }, e.span()),
+            }
+        }
+        only_self
+    }
+
+    /// `use a::{b, c::{d as e}, f::*}`: one import item per leaf, spilled.
+    /// Iterative: a stack of (tree element, prefix length).
+    fn use_tree(&mut self, node: &'t Node<K>, mods: u32, span: Span) {
+        let vis = vis_of_mods(mods);
+        let attrs = core::mem::take(&mut self.pending_attrs);
+        let start = self.spill.len();
+        let mut prefix: Vec<Segment> = Vec::new();
+        let mut root = PathRoot::Relative;
+        let mut stack: Vec<(UseElem<'t, K>, usize)> = alloc::vec![(UseElem::Tree(node), 0)];
+        let mut kids = Vec::new();
+        let mut children: Vec<&'t Element<K>> = Vec::new();
+        let mut first = true;
+        while let Some((elem, plen)) = stack.pop() {
+            prefix.truncate(plen);
+            let (tree_span, path_elem, alias_elem, glob, group, kids_children) = match elem {
+                UseElem::Tree(n) => {
+                    let Some(Arch::UseTree {
+                        path,
+                        alias,
+                        children: ch,
+                    }) = self.m.rule_for(n.kind()).copied()
+                    else {
+                        continue;
+                    };
+                    pick::collect_kids(n, self.labeler, self.m, &mut kids, None);
+                    let glob = kids.iter().any(|k| match k.elem {
+                        Element::Token(t) => self.m.modifier_for(t.kind()) == Some(Modifier::Glob),
+                        Element::Node(_) => false,
+                    });
+                    children.clear();
+                    pick::list(ch, &kids, self.m, &mut children);
+                    // A group, even an empty one (`use a::{}` imports
+                    // nothing), is not a leaf.
+                    let group = pick::single(ch, &kids, self.m).is_some();
+                    let p = pick::single(path, &kids, self.m);
+                    let a = pick::single(alias, &kids, self.m);
+                    (n.span(), p, a, glob, group, children.clone())
+                }
+                UseElem::Leaf(e) => {
+                    let glob = matches!(e, Element::Token(t) if self.m.modifier_for(t.kind()) == Some(Modifier::Glob));
+                    (
+                        e.span(),
+                        if glob { None } else { Some(e) },
+                        None,
+                        glob,
+                        false,
+                        Vec::new(),
+                    )
+                }
+            };
+            let only_self = match path_elem {
+                Some(p) => self.read_segments(p, &mut prefix, &mut root, first),
+                None => false,
+            };
+            first = false;
+            if group {
+                let here = prefix.len();
+                for &c in kids_children.iter().rev() {
+                    let child = match c {
+                        Element::Node(n)
+                            if matches!(self.m.rule_for(n.kind()), Some(Arch::UseTree { .. })) =>
+                        {
+                            UseElem::Tree(n)
+                        }
+                        _ => UseElem::Leaf(c),
+                    };
+                    stack.push((child, here));
+                }
+                continue;
+            }
+            // A leaf: the import of the prefix (with `self`, the prefix itself).
+            let _ = only_self;
+            if prefix.is_empty() {
+                self.report(ProblemKind::MissingField { field: "path" }, tree_span);
+                continue;
+            }
+            let alias = alias_elem.and_then(|a| self.name_of(a));
+            self.at(tree_span);
+            let segments = self.list(&prefix);
+            let path = self.path(Path {
+                root,
+                ..Path::new(segments, Ns::Import)
+            });
+            let mut item = Item::new(
+                if glob {
+                    None
+                } else {
+                    alias.map(|(s, _)| Name::new(s))
+                },
+                ItemKind::Import { path, glob },
+            )
+            .with_vis(vis);
+            if let (Some((_, aspan)), false) = (alias, glob) {
+                item = item.with_name_span(aspan);
+            }
+            let id = self.it(item);
+            if attrs.1 > 0 {
+                let mut v = Val::Item(id);
+                self.attach_attrs(&mut v, attrs, tree_span);
+            }
+            self.spill.push(Slot {
+                v: Val::Item(id),
+                span: tree_span,
+                place: false,
+            });
+        }
+        let len = self.spill.len() - start;
+        let v = Val::Spill(
+            u32::try_from(start).unwrap_or(0),
+            u32::try_from(len).unwrap_or(0),
+        );
+        self.push(v, span);
+    }
+
+    // -------------------------------------------------------- interpolation
+
+    /// An interpolated string: text pieces decode now (into the run's piece
+    /// list), embedded expressions are scheduled as the frame's one field.
+    fn enter_interp(&mut self, mut f: Frame<K>, parts: Pick<K>, close: Pick<K>) {
+        let mut elems: Vec<&'t Element<K>> = Vec::new();
+        pick::list(parts, &self.kids, self.m, &mut elems);
+        // A heredoc: the closing marker's leading whitespace is the
+        // indentation every body line loses.
+        let indent: Option<&'t str> = match self.pick1(close) {
+            Some(Element::Token(t)) => {
+                let text = self.text_of(t.span());
+                let n = text.len() - text.trim_start_matches([' ', '\t']).len();
+                Some(text.get(..n).unwrap_or(""))
+            }
+            _ => None,
+        };
+        if let Some(ind) = indent {
+            if ind.contains(' ') && ind.contains('\t') {
+                self.report(ProblemKind::InvalidLiteral, f.span);
+            }
+        }
+        let base = self.pieces.len();
+        let mut exprs: Vec<&'t Element<K>> = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut raw = alloc::string::String::new();
+        let mut text_span: Option<Span> = None;
+        let mut at_line_start = true;
+        let mut reported_indent = false;
+        let last_text = elems.iter().rposition(|e| self.str_part(e).is_some());
+        let last_is_text = last_text.is_some() && last_text == elems.len().checked_sub(1);
+        for (i, &e) in elems.iter().enumerate() {
+            if let Some((t, esc)) = self.str_part(e) {
+                let span = t.span();
+                let text = self.text_of(span);
+                raw.clear();
+                match indent {
+                    Some(ind) => {
+                        // Strip the indentation at every line start.
+                        for (j, line) in text.split_inclusive('\n').enumerate() {
+                            let starts = at_line_start || j > 0;
+                            let body = if starts && !(line == "\n" || line == "\r\n") {
+                                match line.strip_prefix(ind) {
+                                    Some(rest) => rest,
+                                    None => {
+                                        if !reported_indent {
+                                            reported_indent = true;
+                                            self.report(ProblemKind::InvalidLiteral, span);
+                                        }
+                                        line.trim_start_matches([' ', '\t'])
+                                    }
+                                }
+                            } else {
+                                line
+                            };
+                            raw.push_str(body);
+                        }
+                        at_line_start = text.ends_with('\n');
+                        // The newline before the closing marker is not text.
+                        if last_is_text && Some(i) == last_text && raw.ends_with('\n') {
+                            let _ = raw.pop();
+                            if raw.ends_with('\r') {
+                                let _ = raw.pop();
+                            }
+                        }
+                    }
+                    None => raw.push_str(text),
+                }
+                let raw_owned = core::mem::take(&mut raw);
+                self.decode_escapes(&raw_owned, span, esc, false);
+                raw = raw_owned;
+                buf.extend_from_slice(&self.text);
+                text_span = Some(text_span.map_or(span, |s| s.merge(span)));
+            } else {
+                // An empty text piece (a heredoc's last newline, `""`
+                // between expressions) adds nothing to the join.
+                if let Some(sp) = text_span.take() {
+                    if !buf.is_empty() {
+                        let piece = self.text_piece(&buf, sp);
+                        self.pieces.push(piece);
+                    }
+                }
+                buf.clear();
+                // A heredoc line that starts with an expression has no
+                // indentation at all: less than the closing marker's.
+                if at_line_start && indent.is_some_and(|ind| !ind.is_empty()) && !reported_indent {
+                    reported_indent = true;
+                    self.report(ProblemKind::InvalidLiteral, e.span());
+                }
+                at_line_start = false;
+                exprs.push(e);
+                self.pieces.push(Piece::Expr);
+            }
+        }
+        if let Some(sp) = text_span.take() {
+            if !buf.is_empty() {
+                let piece = self.text_piece(&buf, sp);
+                self.pieces.push(piece);
+            }
+        }
+        let len = self.pieces.len() - base;
+        f.aux = (
+            u32::try_from(base).unwrap_or(u32::MAX),
+            u32::try_from(len).unwrap_or(u32::MAX),
+        );
+        // One field: the expressions, in order.
+        f.counts_base = self.counts.len();
+        f.nfields = 1;
+        f.vals_base = self.vals.len();
+        f.spill_base = self.spill.len();
+        self.counts.push(exprs.len());
+        self.open(f);
+        self.tasks.push(Task::Finish);
+        for &e in exprs.iter().rev() {
+            self.tasks.push(Task::Elem(e, Want::Expr));
+        }
+    }
+
+    /// A `StrPart` token and its escapes.
+    fn str_part(&self, e: &'t Element<K>) -> Option<(&'t syntax_lang::Token<K>, Escapes)> {
+        match e {
+            Element::Token(t) => match self.m.role_for(t.kind()) {
+                Some(TokenRole::StrPart(esc)) => Some((t, esc)),
+                _ => None,
+            },
+            Element::Node(_) => None,
+        }
+    }
+
+    /// A decoded text piece (invalid UTF-8 is reported and dropped).
+    fn text_piece(&mut self, bytes: &[u8], span: Span) -> Piece {
+        match core::str::from_utf8(bytes) {
+            Ok(s) => Piece::Text(self.b.text(s), span),
+            Err(_) => {
+                self.report(ProblemKind::InvalidLiteral, span);
+                Piece::Text(self.b.text(""), span)
+            }
+        }
     }
 }
 
@@ -1363,4 +1750,26 @@ fn declared_effects(mods: u32) -> Effects {
         }
     }
     e
+}
+
+/// An element of a use tree on the walk's stack.
+#[derive(Clone, Copy)]
+enum UseElem<'t, K> {
+    /// A use-tree node.
+    Tree(&'t Node<K>),
+    /// A name, a path, a `*`, or a `self`: a leaf of its parent's prefix.
+    Leaf(&'t Element<K>),
+}
+
+/// Visibility from modifiers: the most public one wins.
+const fn vis_of_mods(mods: u32) -> hir_lang::Vis {
+    if has(mods, Modifier::Public) {
+        hir_lang::Vis::Public
+    } else if has(mods, Modifier::Protected) {
+        hir_lang::Vis::Protected
+    } else if has(mods, Modifier::Package) {
+        hir_lang::Vis::Package
+    } else {
+        hir_lang::Vis::Private
+    }
 }

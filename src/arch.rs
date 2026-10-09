@@ -10,6 +10,7 @@
 
 use hir_lang::CaptureMode;
 
+use crate::mapping::Join;
 use crate::pick::Pick;
 use crate::template::TemplateId;
 
@@ -155,8 +156,11 @@ pub enum Arch<K> {
         mutable: bool,
         /// Function-scoped hoisting (JavaScript `var`): the name is declared
         /// once at the top of the enclosing function (or module body) and this
-        /// statement becomes an assignment. Applies to identifier patterns;
-        /// other patterns lower as an ordinary `let`.
+        /// statement becomes an assignment. Any other pattern (`var [a, b] =
+        /// x`) binds hygienic temporaries that are assigned to the hoisted
+        /// names right after it matches; a by-reference binding cannot be
+        /// hoisted this way and is reported
+        /// ([`CannotHoist`](crate::ProblemKind::CannotHoist)).
         hoist: bool,
     },
     /// `EXPR;` — an expression evaluated for its effect (never a block tail).
@@ -189,6 +193,28 @@ pub enum Arch<K> {
         path: Pick<K>,
         /// The alias (`as c`).
         alias: Pick<K>,
+    },
+    /// A use tree: `use a::{b, c::{d, e as f}, g::*};` (Rust), `use App\{Foo,
+    /// Bar as Baz};` (PHP group use). Flattened into one HIR import per leaf,
+    /// each path the concatenation of the prefixes above it. Modifiers:
+    /// visibility (on the outermost tree, for every import it makes), `Glob`
+    /// (a `*` leaf).
+    ///
+    /// The expected tree: a use-tree node holds an optional prefix `path` (a
+    /// path node or one name), then either nested `children` (use-tree nodes,
+    /// names, or paths; container nodes such as `{ ... }` splice) or, for a
+    /// leaf, an optional `alias`. A child spelled `self` (a token in the
+    /// [root table](crate::MappingBuilder::root) mapping to
+    /// `PathRoot::SelfModule`) imports the prefix itself. Leading root tokens
+    /// of the outermost prefix (`::`, `crate`, `super`) set the import's root.
+    /// The walk is iterative; nesting depth is bounded only by the tree.
+    UseTree {
+        /// The prefix (or, for a leaf, the whole path).
+        path: Pick<K>,
+        /// A leaf's alias (`as f`).
+        alias: Pick<K>,
+        /// List: the nested trees of a group.
+        children: Pick<K>,
     },
 
     // ------------------------------------------------------------ declarations
@@ -306,10 +332,29 @@ pub enum Arch<K> {
         /// Whether it is assignable without a `Mut` modifier.
         mutable: bool,
     },
-    /// A mixin use inside a class (PHP `use T, U;`).
+    /// A mixin use inside a class (PHP `use T, U { rules }`).
     MixinUse {
         /// List: the mixins (types).
         mixins: Pick<K>,
+        /// List: conflict-resolution rules ([`MixinRule`](Arch::MixinRule)
+        /// nodes).
+        rules: Pick<K>,
+    },
+    /// One rule of a mixin use: `T::hello insteadof U, V;` or
+    /// `T::hello as protected greet;` / `hello as private;`. With
+    /// `insteadof` types it is an exclusion; otherwise an alias, with a new
+    /// name, a visibility modifier (`Public`, `Protected`, `Private`), or both.
+    /// A rule with neither is reported ([`MissingField`](crate::ProblemKind::MissingField)
+    /// `action`).
+    MixinRule {
+        /// The mixin the method comes from (`T` in `T::hello`), a type.
+        from: Pick<K>,
+        /// Required: the method's name.
+        method: Pick<K>,
+        /// List: the mixins it is taken instead of (types).
+        insteadof: Pick<K>,
+        /// The new name of an alias.
+        alias: Pick<K>,
     },
     /// A field of a record, variant, or class. Modifiers: visibility; in a
     /// class, `Static` makes it a static (global) member instead.
@@ -689,6 +734,57 @@ pub enum Arch<K> {
     /// A node lowered through a template; see
     /// [`MappingBuilder::template_node`](crate::MappingBuilder::template_node).
     Template(TemplateUse),
+    /// An interpolated string: `"Hello {$name}!"`, `"$name"`, `"{$a['k']}"`,
+    /// and heredocs, as the lexer delivers them in segments.
+    ///
+    /// The expected tree: the string's node holds its pieces in order. Text
+    /// pieces are tokens with role [`TokenRole::StrPart`](crate::TokenRole::StrPart)
+    /// (no quotes; escapes decoded, adjacent pieces merged); every other
+    /// selected element is an embedded expression (`$name` as a variable
+    /// token, `{$a['k']}` as an index node; braces and quotes are skip kinds
+    /// or left out by the `parts` pick). The parts are joined by `join`:
+    /// one text piece alone is a string literal, no pieces the empty string,
+    /// and a lone expression is joined with an empty string first, so the
+    /// result is always a string conversion.
+    ///
+    /// With `close` (a heredoc), `close` picks the closing-marker token: the
+    /// whitespace before its identifier is removed from the start of every
+    /// line of the text pieces (PHP 7.3+), a line indented less (or starting
+    /// with an embedded expression) is reported
+    /// ([`InvalidLiteral`](crate::ProblemKind::InvalidLiteral)), and the
+    /// newline before the marker is dropped.
+    Interp {
+        /// List: the pieces, in order.
+        parts: Pick<K>,
+        /// A heredoc's closing-marker token.
+        close: Pick<K>,
+        /// How the pieces become one string.
+        join: Join,
+    },
+
+    // -------------------------------------------------------------- attributes
+    /// An attribute (`#[Route("/home", methods: GET)]`, `@inline`), attached
+    /// to the node it is a direct child of. Attribute nodes (and container
+    /// nodes holding them, such as PHP's `#[A, B]` group) are invisible to
+    /// every other pick of that node. HIR attributes are data, never code
+    /// (HIR spec §11): an argument value must be a literal or a name; anything
+    /// else is reported
+    /// ([`AttributeArgument`](crate::ProblemKind::AttributeArgument)) and left
+    /// out.
+    Attr {
+        /// Required: the attribute's name, kept as written (a qualified name
+        /// such as `\App\Route` keeps its separators).
+        name: Pick<K>,
+        /// List: the arguments ([`AttrArg`](Arch::AttrArg) nodes, or values).
+        args: Pick<K>,
+    },
+    /// `key: value` / `key = value` inside an attribute's arguments.
+    AttrArg {
+        /// The key.
+        key: Pick<K>,
+        /// The value (absent: a bare key).
+        value: Pick<K>,
+    },
 
     // ---------------------------------------------------------------- patterns
     /// `_` as a node.
@@ -904,6 +1000,11 @@ impl<K> Arch<K> {
             Self::Const { .. } => "constant",
             Self::GlobalVar { .. } => "global variable",
             Self::MixinUse { .. } => "mixin use",
+            Self::MixinRule { .. } => "mixin rule",
+            Self::UseTree { .. } => "use tree",
+            Self::Interp { .. } => "interpolated string",
+            Self::Attr { .. } => "attribute",
+            Self::AttrArg { .. } => "attribute argument",
             Self::FieldDecl { .. } => "field",
             Self::VariantDecl { .. } => "variant",
             Self::GenericParam { .. } => "generic parameter",

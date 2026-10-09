@@ -6,6 +6,9 @@
 //! - `templates/*`: a calc program that is mostly `while` loops and `&&`, so
 //!   much of the HIR comes from template instantiation.
 //! - `deep/*`: one 100,000-deep chain of prefix operators.
+//! - `php/*`: Mox (PHP) code under `LangPolicy::php()`: functions with
+//!   `foreach` and `catch` whose variables are function-scoped, interpolated
+//!   strings, heredocs, and group `use` declarations.
 //!
 //! Sizes are counted in syntax-tree *elements* (nodes plus tokens, trivia
 //! included) and printed when each benchmark starts.
@@ -14,6 +17,8 @@
 
 #[path = "../tests/common/mod.rs"]
 mod common;
+#[path = "../tests/support/mox.rs"]
+mod mox;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use intern_lang::Interner;
@@ -130,5 +135,146 @@ fn deep(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, calc, templates, deep);
+/// `n` Mox functions, each:
+///
+/// ```text
+/// use App\Models\{User, Post as P};
+/// function fN($items) {
+///     foreach ($items as $k => $v) { echo "item {$k}: $v!"; }
+///     try { echo $k; } catch (Ex $e) { echo <<<EOT
+///         at {$e}
+///         EOT; }
+///     echo $v, $e;
+/// }
+/// ```
+fn php_program(n: usize) -> (Node<mox::M>, String) {
+    use mox::{M, W};
+    let mut w = W::new();
+    w.open(M::File);
+    for i in 0..n {
+        w.open(M::UseStmt).t(M::UseKw, "use").open(M::UseDecl);
+        w.open(M::NsName)
+            .t(M::Ident, "App")
+            .t(M::NsSep, "\\")
+            .t(M::Ident, "Models")
+            .close();
+        w.t(M::NsSep, "\\").open(M::UseGroup).t(M::UseOpen, "{");
+        w.open(M::UseDecl)
+            .t(M::Ident, "User")
+            .close()
+            .t(M::Comma, ",");
+        w.open(M::UseDecl)
+            .t(M::Ident, "Post")
+            .t(M::As, "as")
+            .t(M::Ident, "P")
+            .close();
+        w.t(M::UseClose, "}")
+            .close()
+            .close()
+            .t(M::Semi, ";")
+            .close();
+        w.open(M::FnDecl)
+            .t(M::Function, "function")
+            .t(M::Ident, &format!("f{i}"))
+            .t(M::LParen, "(");
+        w.open(M::Params)
+            .open(M::Param)
+            .var("items")
+            .close()
+            .close();
+        w.t(M::RParen, ")").open(M::Block).t(M::LBrace, "{");
+        w.open(M::Foreach)
+            .t(M::ForeachKw, "foreach")
+            .t(M::LParen, "(")
+            .var("items")
+            .t(M::As, "as")
+            .var("k")
+            .t(M::FatArrow, "=>")
+            .var("v")
+            .t(M::RParen, ")");
+        w.open(M::Block).t(M::LBrace, "{");
+        w.open(M::Echo).t(M::EchoKw, "echo");
+        w.open(M::DqString)
+            .t(M::DQuote, "\"")
+            .t(M::StrPart, "item ")
+            .t(M::CurlyOpen, "{")
+            .var("k")
+            .t(M::CurlyClose, "}")
+            .t(M::StrPart, ": ")
+            .var("v")
+            .t(M::StrPart, "!")
+            .t(M::DQuote, "\"")
+            .close();
+        w.t(M::Semi, ";").close();
+        w.t(M::RBrace, "}").close().close();
+        w.open(M::ExprStmt).open(M::Try).t(M::TryKw, "try");
+        w.open(M::Block)
+            .t(M::LBrace, "{")
+            .open(M::Echo)
+            .t(M::EchoKw, "echo")
+            .var("k")
+            .t(M::Semi, ";")
+            .close()
+            .t(M::RBrace, "}")
+            .close();
+        w.open(M::Catch)
+            .t(M::CatchKw, "catch")
+            .t(M::LParen, "(")
+            .t(M::Ident, "Ex")
+            .var("e")
+            .t(M::RParen, ")");
+        w.open(M::Block)
+            .t(M::LBrace, "{")
+            .open(M::Echo)
+            .t(M::EchoKw, "echo");
+        w.open(M::HeredocStr)
+            .t(M::HeredocOpen, "<<<EOT\n")
+            .t(M::StrPart, "    at ")
+            .t(M::CurlyOpen, "{")
+            .var("e")
+            .t(M::CurlyClose, "}")
+            .t(M::StrPart, "\n")
+            .t(M::HeredocClose, "    EOT")
+            .close();
+        w.t(M::Semi, ";").close().t(M::RBrace, "}").close();
+        w.close().close().t(M::Semi, ";").close();
+        w.open(M::Echo)
+            .t(M::EchoKw, "echo")
+            .var("v")
+            .t(M::Comma, ",")
+            .var("e")
+            .t(M::Semi, ";")
+            .close();
+        w.t(M::RBrace, "}").close().close();
+    }
+    w.close();
+    w.finish()
+}
+
+fn php(c: &mut Criterion) {
+    let mapping = mox::mox_mapping();
+    let mut g = c.benchmark_group("php");
+    g.sample_size(10);
+    for (label, n) in [("100k", 1_050), ("1m", 10_500)] {
+        let (tree, src) = php_program(n);
+        let elems = elements(&tree);
+        println!(
+            "php/{label}: {elems} syntax-tree elements, {} bytes",
+            src.len()
+        );
+        g.throughput(Throughput::Elements(elems));
+        g.bench_with_input(BenchmarkId::from_parameter(label), &tree, |b, tree| {
+            b.iter(|| {
+                let mut names = Interner::new();
+                let out =
+                    lower_lang::lower(tree, &src, &mapping, &mut names).expect("within budget");
+                assert!(out.problems.is_empty(), "{:?}", &out.problems[..1]);
+                out.hir
+            });
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, calc, templates, deep, php);
 criterion_main!(benches);

@@ -79,6 +79,56 @@ Dependency wiring (decided here, recorded per the anti-deferral rule):
   later if wanted.
 - **lang-forge: dev-dependency only** (registry 1.0.1), for the worked example.
 
+## v0.3.0 - PHP and Python semantics (DONE)
+ISSUES P15, before the Mox Demo. Breaking changes allowed (0.x) and listed in
+the CHANGELOG.
+
+Delivered:
+- [x] PHP scoping: `LangPolicy::function_scoped_bindings` (on in the new
+      `LangPolicy::php()` preset). `foreach` key/value (every template
+      pattern hole) and `catch` variables belong to the function; every
+      binding pattern shape is hoisted (hygienic temporary + `Desugar`
+      expansion `hoist` + assignment after the match); what cannot be
+      (by-reference, a hole bound twice, a cut binding site) is the precise
+      problem `CannotHoist { reason: HoistBlocker }`. A hoisted `Let` with a
+      destructuring pattern uses the same mechanism.
+- [x] String interpolation: `Arch::Interp { parts, close, join }` with
+      `Join::{Fold, Call, Template}` (concat fold, one call, or template
+      holes); PHP `"Hello {$name}"`, `"$name"`, `"{$a['k']}"`; CST shape
+      documented in `tests/support/mox.rs`.
+- [x] Literal decoding table: `TokenRole::RawStr`, `TokenRole::Heredoc`
+      (heredoc/nowdoc with PHP 7.3 indentation stripping), `TokenRole::StrPart`,
+      `Literals { separators, legacy_octal, hex_floats }`; integers beyond 64
+      bits follow the overflow policy (PHP: float above `i64::MAX`), exact
+      big integers for every radix otherwise.
+- [x] Text-keyed operator tables (`*_op_text`).
+- [x] Trait `insteadof`/`as` (`Arch::MixinRule`, `MixinUse.rules`) and nested
+      use trees (`Arch::UseTree`) to their HIR forms.
+- [x] Attributes (`Arch::Attr`, `Arch::AttrArg`) to HIR attributes, with
+      `AttributeArgument` / `MisplacedAttribute` problems.
+- [x] Mox test support (`LangPolicy::php()`, the new CST shapes) and example
+      `php`; property tests against references in `tests/semantics.rs`; the
+      random-tree properties run under the PHP policy and check that they
+      reach the new paths. Benchmark group `php`.
+
+Dependency wiring (decided here, recorded per the anti-deferral rule):
+- **resolve-lang: not wired, not even as a dev-dependency (yet).** The P15
+  brief allows it in tests only. resolve-lang 0.3.0 (case-folded PHP names,
+  trait rules, C3) is prepared alongside this release but not on crates.io,
+  and the family takes first-party crates from the registry by version, never
+  by path. The tests resolve locals with a small resolver over hir-lang's
+  `lookup_local`, which is enough for the scoping and hygiene properties.
+  **Moved to v0.4.0:** add `resolve-lang = "0.3"` as a dev-dependency and
+  run the Mox tests through the real resolver once 0.3.0 is published.
+- Everything else unchanged from v0.2.0 (syntax-lang 1, hir-lang 0.3,
+  intern-lang 1 wired; span-lang, macro-lang, diag-lang not wired;
+  lang-forge 1.0.1 dev-dependency).
+
+## v0.4.0 - Resolver in the loop
+- [ ] `resolve-lang = "0.3"` as a dev-dependency once published; Mox tests and
+      the random-tree properties resolve through it (moved from v0.3.0, see
+      above).
+
 ## v0.5.0 - Implementation
 - [x] Quasi-quoted HIR templates with ${field} holes and hygienic expansion — delivered programmatically in v0.2.0.
 - [x] Budgets; diagnostics with spans; benchmarks — delivered in v0.2.0.
@@ -92,11 +142,14 @@ Dependency wiring (decided here, recorded per the anti-deferral rule):
       implemented and tested with a hand-written labeler; lang-forge 1.x trees
       carry no labels).
 - [ ] Gaps found while building 0.2 (not in the 0.2 brief; recorded so they are
-      not lost): PHP trait conflict rules (`insteadof` / `as`, HIR `MixinRule`);
-      nested import trees (`use a::{b, c}`); string interpolation; attributes
-      (HIR's attribute side table); recursive-closure `self_binder`; foreign
-      functions (`abi`); template closures that capture and declare effects;
-      `Problem` → `diag_lang::Diagnostic` if the app wants it here.
+      not lost): recursive-closure `self_binder`; foreign functions (`abi`);
+      template closures that capture and declare effects; `Problem` →
+      `diag_lang::Diagnostic` if the app wants it here. (Trait conflict
+      rules, nested import trees, string interpolation, and attributes were
+      delivered in v0.3.0.)
+- [ ] Gaps found while building 0.3: by-reference `foreach` bindings under PHP
+      scoping (needs an HIR reference-binding assignment, reported as
+      `CannotHoist` today); attribute name resolution (kept as written).
 
 ## v0.9.0 - Hardening
 - [ ] Fuzzing over random trees **and random mappings** (0.2 fuzzes trees over

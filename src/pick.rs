@@ -153,19 +153,53 @@ pub(crate) trait KindSets<K> {
     fn is_skip(&self, kind: &K) -> bool;
     /// Whether list picks splice this node kind's children in place.
     fn is_container(&self, kind: &K) -> bool;
+    /// Whether nodes of this kind are attributes (invisible to picks).
+    fn is_attr(&self, _kind: &K) -> bool {
+        false
+    }
 }
 
 /// Collects `node`'s significant children (and their labels) into `out`.
-pub(crate) fn collect_kids<'t, K: TokenKind>(
+/// Attribute nodes, and container nodes whose significant non-skip children
+/// are all attributes (an attribute group such as `#[A, B]`), are not
+/// children for picks: with `attrs`, the attributes are collected there
+/// instead (a group's attributes spliced in order). A container that mixes
+/// attributes with other children is an ordinary container.
+pub(crate) fn collect_kids<'t, K: Copy + TokenKind>(
     node: &'t Node<K>,
     labeler: Option<&dyn Labeler<K>>,
+    sets: &dyn KindSets<K>,
     out: &mut Vec<Kid<'t, K>>,
+    mut attrs: Option<&mut Vec<&'t Element<K>>>,
 ) {
     out.clear();
+    if let Some(a) = attrs.as_deref_mut() {
+        a.clear();
+    }
     for (index, elem) in node.children().enumerate() {
-        if let Element::Token(t) = elem {
-            if t.kind().is_trivia() {
-                continue;
+        match elem {
+            Element::Token(t) => {
+                if t.kind().is_trivia() {
+                    continue;
+                }
+            }
+            Element::Node(n) => {
+                if sets.is_attr(n.kind()) {
+                    if let Some(a) = attrs.as_deref_mut() {
+                        a.push(elem);
+                    }
+                    continue;
+                }
+                if sets.is_container(n.kind()) && is_attr_group(n, sets) {
+                    if let Some(a) = attrs.as_deref_mut() {
+                        a.extend(
+                            n.children().filter(
+                                |c| matches!(c, Element::Node(x) if sets.is_attr(x.kind())),
+                            ),
+                        );
+                    }
+                    continue;
+                }
             }
         }
         let label = match labeler {
@@ -174,6 +208,29 @@ pub(crate) fn collect_kids<'t, K: TokenKind>(
         };
         out.push(Kid { elem, label });
     }
+}
+
+/// Whether a container node holds attributes and nothing else significant
+/// (skip kinds such as `#[`, `,`, `]` aside).
+fn is_attr_group<K: Copy + TokenKind>(n: &Node<K>, sets: &dyn KindSets<K>) -> bool {
+    let mut any = false;
+    for c in n.children() {
+        match c {
+            Element::Token(t) => {
+                if !t.kind().is_trivia() && !sets.is_skip(t.kind()) {
+                    return false;
+                }
+            }
+            Element::Node(x) => {
+                if sets.is_attr(x.kind()) {
+                    any = true;
+                } else if !sets.is_skip(x.kind()) {
+                    return false;
+                }
+            }
+        }
+    }
+    any
 }
 
 /// The element's kind.
@@ -412,7 +469,7 @@ mod tests {
     fn test_positional_picks_skip_trivia() {
         let root = sample();
         let mut kids = Vec::new();
-        collect_kids(&root, None, &mut kids);
+        collect_kids(&root, None, &Sets, &mut kids, None);
         assert_eq!(kids.len(), 5);
         let span = |p| single(p, &kids, &Sets).map(|e| e.span().start().to_u32());
         assert_eq!(span(Pick::Nth(1)), Some(2));
@@ -433,7 +490,7 @@ mod tests {
     fn test_list_picks_splice_containers_and_drop_skips() {
         let root = sample();
         let mut kids = Vec::new();
-        collect_kids(&root, None, &mut kids);
+        collect_kids(&root, None, &Sets, &mut kids, None);
         let starts = |p| {
             let mut out = Vec::new();
             list(p, &kids, &Sets, &mut out);
@@ -460,7 +517,7 @@ mod tests {
         }
         let root = sample();
         let mut kids = Vec::new();
-        collect_kids(&root, Some(&Odd), &mut kids);
+        collect_kids(&root, Some(&Odd), &Sets, &mut kids, None);
         let first = single(Pick::Label(3), &kids, &Sets).map(|e| e.span().start().to_u32());
         assert_eq!(first, Some(0));
         let mut out = Vec::new();
@@ -477,7 +534,7 @@ mod tests {
         }
         let root = Node::new(K::Root, vec![Element::Node(node)]);
         let mut kids = Vec::new();
-        collect_kids(&root, None, &mut kids);
+        collect_kids(&root, None, &Sets, &mut kids, None);
         let mut out = Vec::new();
         list(Pick::All, &kids, &Sets, &mut out);
         assert_eq!(out.len(), 1);

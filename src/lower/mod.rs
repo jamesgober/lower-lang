@@ -33,6 +33,9 @@ use crate::pick::{self, Kid, Labeler, Pick};
 use crate::problem::{Context, LowerError, Problem, ProblemKind};
 use crate::template::TemplateId;
 
+/// A range of the run's attribute pool: (start, len).
+pub(crate) type AttrRange = (u32, u32);
+
 /// Limits on what one lowering may do. Untrusted trees and templates cannot
 /// exceed them; exceeding one is a reported problem or error, never a hang.
 ///
@@ -252,6 +255,9 @@ pub(crate) struct PatSite {
     pub(crate) arm: bool,
     /// A range bound: bare identifiers are constants, not bindings.
     pub(crate) bound: bool,
+    /// The binders belong to the enclosing function: the pattern binds
+    /// hygienic temporaries that the consumer assigns to hoisted names.
+    pub(crate) persist: bool,
 }
 
 impl PatSite {
@@ -260,13 +266,33 @@ impl PatSite {
         mutable: false,
         arm: false,
         bound: false,
+        persist: false,
     };
     pub(crate) const ARM: Self = Self {
         param: false,
         mutable: false,
         arm: true,
         bound: false,
+        persist: false,
     };
+}
+
+/// A function-scoped binding made by a pattern: the temporary the pattern
+/// binds, and the hoisted name it is assigned to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Persist {
+    pub(crate) tmp: BinderId,
+    pub(crate) sym: Symbol,
+    pub(crate) span: Span,
+}
+
+/// One piece of an interpolated string under construction.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Piece {
+    /// Decoded text.
+    Text(hir_lang::TextRef, Span),
+    /// The next value of the frame's expression field.
+    Expr,
 }
 
 /// The context an element is lowered in, and so the kind of value it leaves.
@@ -299,6 +325,8 @@ pub(crate) enum Want {
     Capture,
     /// A field definition.
     Field,
+    /// A mixin rule.
+    Rule,
     /// A sum variant.
     Variant,
     /// A generic parameter.
@@ -330,6 +358,7 @@ impl Want {
             Self::Arm => Context::Arm,
             Self::Capture => Context::Capture,
             Self::Field => Context::Field,
+            Self::Rule => Context::Member,
             Self::Variant => Context::Variant,
             Self::Generic | Self::GArg | Self::Where => Context::Generic,
             Self::Entry | Self::Init => Context::Entry,
@@ -364,8 +393,8 @@ pub(crate) enum Val {
     Path(PathId),
     Seg(Segment),
     /// A parameter, created as a node by the enclosing function so that list
-    /// markers can still adjust its kind.
-    Param(Param, Span),
+    /// markers can still adjust its kind; with its attributes.
+    Param(Param, Span, AttrRange),
     /// A `*` or `/` marker in a parameter list.
     Marker(ParamKind),
     Arg(Arg),
@@ -380,6 +409,7 @@ pub(crate) enum Val {
     Entry(MapEntry),
     Init(FieldInit),
     FieldPat(FieldPat),
+    Rule(hir_lang::MixinRule),
 }
 
 /// A value on the value stack, with the span of the element it came from and
@@ -400,6 +430,9 @@ pub(crate) enum Task<'t, K> {
     Node(&'t Node<K>, Want),
     /// Finish the innermost open frame.
     Finish,
+    /// Record where the persistent-binding log stands (between the fields of
+    /// a template node, so each pattern hole's bindings are known).
+    Mark,
 }
 
 /// What a frame builds when it finishes.
@@ -439,6 +472,8 @@ pub(crate) struct Frame<K> {
     /// Names read synchronously at entry (declaration names, aliases,
     /// members, labels).
     pub(crate) name: Option<(Symbol, Span)>,
+    /// A second synchronous name (a mixin rule's alias).
+    pub(crate) alias: Option<(Symbol, Span)>,
     /// A binder created or found at entry (a label, a pattern's binder).
     pub(crate) binder: Option<BinderId>,
     /// A tuple-field index (`a.0`).
@@ -448,6 +483,11 @@ pub(crate) struct Frame<K> {
     pub(crate) flag: bool,
     /// A path's root, read from its leading tokens.
     pub(crate) path_root: hir_lang::PathRoot,
+    /// The node's attributes in the run's pool.
+    pub(crate) attrs: AttrRange,
+    /// An archetype-specific range: an interpolation's pieces, or the
+    /// persistent-binding log mark of a hoisting `let`.
+    pub(crate) aux: (u32, u32),
 }
 
 /// A function, closure, or module body under construction: its effects and
@@ -494,6 +534,20 @@ pub(crate) struct Run<'a, 't, K> {
     pub(crate) tpl_scratch: tpl::TplScratch,
     pub(crate) lists: Lists,
     pub(crate) tfields: Vec<(Pick<K>, Want, bool)>,
+    /// Attribute elements of the node being entered.
+    pub(crate) attr_elems: Vec<&'t Element<K>>,
+    /// Attributes lowered so far, referenced by ranges.
+    pub(crate) attr_pool: Vec<hir_lang::Attr>,
+    /// The attributes of the node being entered, until a frame takes them.
+    pub(crate) pending_attrs: AttrRange,
+    /// Function-scoped bindings not yet assigned by their consumer.
+    pub(crate) persist: Vec<Persist>,
+    /// (frame depth, persist log length) at each `Task::Mark`.
+    pub(crate) persist_marks: Vec<(u32, u32)>,
+    /// Pieces of the interpolated strings being lowered.
+    pub(crate) pieces: Vec<Piece>,
+    /// The expansion name of hoisting temporaries (`hoist`).
+    pub(crate) hoist_sym: Symbol,
 }
 
 /// Typed scratch lists for building HIR lists without allocating per node.
@@ -519,6 +573,9 @@ where
     ) -> Result<Self, LowerError> {
         let empty = names
             .try_intern("")
+            .map_err(|_| LowerError::SymbolSpaceExhausted)?;
+        let hoist_sym = names
+            .try_intern("hoist")
             .map_err(|_| LowerError::SymbolSpaceExhausted)?;
         let mut syms = Vec::with_capacity(cfg.mapping.strings.len());
         for s in &cfg.mapping.strings {
@@ -561,6 +618,13 @@ where
             tpl_scratch: tpl::TplScratch::default(),
             lists: Lists::default(),
             tfields: Vec::new(),
+            attr_elems: Vec::new(),
+            attr_pool: Vec::new(),
+            pending_attrs: (0, 0),
+            persist: Vec::new(),
+            persist_marks: Vec::new(),
+            pieces: Vec::new(),
+            hoist_sym,
         })
     }
 
@@ -572,6 +636,11 @@ where
                 Task::Elem(Element::Token(t), want) => self.lower_token(t, want),
                 Task::Node(n, want) => self.lower_node(n, want),
                 Task::Finish => self.finish(),
+                Task::Mark => {
+                    let depth = u32::try_from(self.frames.len()).unwrap_or(u32::MAX);
+                    let len = u32::try_from(self.persist.len()).unwrap_or(u32::MAX);
+                    self.persist_marks.push((depth, len));
+                }
             }
             if self.nodes > self.budget.max_nodes {
                 return Err(LowerError::NodeBudget {
@@ -613,7 +682,13 @@ where
             self.push(v, span);
             return;
         }
-        pick::collect_kids(node, self.labeler, &mut self.kids);
+        let mut attrs = core::mem::take(&mut self.attr_elems);
+        pick::collect_kids(node, self.labeler, self.m, &mut self.kids, Some(&mut attrs));
+        self.pending_attrs = (0, 0);
+        if !attrs.is_empty() {
+            self.pending_attrs = self.lower_attrs(&attrs);
+        }
+        self.attr_elems = attrs;
         let (start, end) = self.m.rule_range(node.kind());
         let mut chosen = None;
         for &(_, rule) in self.m.by_kind.get(start..end).unwrap_or(&[]) {
@@ -632,6 +707,12 @@ where
                 let v = self.error_val(want, span);
                 self.push(v, span);
             }
+        }
+        // A construct that opened no frame (a wrapper, a capture, ...) has
+        // no node to carry its attributes.
+        if self.pending_attrs.1 > 0 {
+            self.pending_attrs = (0, 0);
+            self.report(ProblemKind::MisplacedAttribute, span);
         }
     }
 
@@ -671,7 +752,7 @@ where
         frame.nfields = fields.len();
         frame.vals_base = self.vals.len();
         frame.spill_base = self.spill.len();
-        self.frames.push(frame);
+        self.open(frame);
         self.tasks.push(Task::Finish);
         let mut end = self.sel.len();
         for (i, &(_, want, _)) in fields.iter().enumerate().rev() {
@@ -712,6 +793,45 @@ where
         }
     }
 
+    /// Opens a frame like [`plan`](Self::plan), and records the
+    /// persistent-binding log before each field and after the last (template
+    /// nodes whose pattern holes bind function-scoped names).
+    pub(crate) fn plan_marked(&mut self, mut frame: Frame<K>, fields: &[(Pick<K>, Want, bool)]) {
+        let counts_base = self.counts.len();
+        self.sel.clear();
+        for &(p, _, many) in fields {
+            let before = self.sel.len();
+            if many {
+                pick::list(p, &self.kids, self.m, &mut self.sel);
+            } else if let Some(e) = pick::single(p, &self.kids, self.m) {
+                self.sel.push(e);
+            }
+            self.counts.push(self.sel.len() - before);
+        }
+        self.drop_shared_children(fields, counts_base);
+        frame.counts_base = counts_base;
+        frame.nfields = fields.len();
+        frame.vals_base = self.vals.len();
+        frame.spill_base = self.spill.len();
+        self.open(frame);
+        self.tasks.push(Task::Finish);
+        self.tasks.push(Task::Mark);
+        let mut end = self.sel.len();
+        for i in (0..fields.len()).rev() {
+            let n = self.counts.get(counts_base + i).copied().unwrap_or(0);
+            let start = end.saturating_sub(n);
+            if let Some(slice) = self.sel.get(start..end) {
+                let want = fields.get(i).map_or(Want::Expr, |f| f.1);
+                for &e in slice.iter().rev() {
+                    self.tasks.push(Task::Elem(e, want));
+                }
+            }
+            self.tasks.push(Task::Mark);
+            end = start;
+        }
+        self.sel.clear();
+    }
+
     /// A frame for `node` with nothing scheduled yet.
     pub(crate) fn frame(&self, arch: Arch<K>, want: Want, span: Span) -> Frame<K> {
         Frame {
@@ -728,11 +848,21 @@ where
             fx: false,
             or: false,
             name: None,
+            alias: None,
             binder: None,
             index: None,
             flag: false,
             path_root: hir_lang::PathRoot::Relative,
+            attrs: (0, 0),
+            aux: (0, 0),
         }
+    }
+
+    /// Pushes an open frame; it takes the attributes of the node being
+    /// entered, which it attaches to its value when it finishes.
+    pub(crate) fn open(&mut self, mut frame: Frame<K>) {
+        frame.attrs = core::mem::take(&mut self.pending_attrs);
+        self.frames.push(frame);
     }
 
     /// The value range of field `i` of `f`.
@@ -896,7 +1026,7 @@ where
             }
             Want::Param => {
                 let pat = self.pt(Pat::Err);
-                Val::Param(Param::new(pat), span)
+                Val::Param(Param::new(pat), span, (0, 0))
             }
             Want::Arg => {
                 let e = self.ex(Expr::Err);
@@ -921,6 +1051,7 @@ where
             | Want::Generic
             | Want::Where
             | Want::Init
+            | Want::Rule
             | Want::FieldPat(_) => Val::Err,
         }
     }
@@ -1019,7 +1150,7 @@ where
                     return Some((self.intern(name), span));
                 }
                 Element::Node(n) => {
-                    pick::collect_kids(n, self.labeler, &mut self.kids2);
+                    pick::collect_kids(n, self.labeler, self.m, &mut self.kids2, None);
                     let arch = self.m.rule_for(n.kind()).copied();
                     let inner = match arch {
                         Some(Arch::Pass { inner } | Arch::Segment { name: inner, .. }) => {
@@ -1166,6 +1297,278 @@ where
             self.declared.truncate(fx.decl_base);
         }
         (effects, stmts)
+    }
+
+    // ----------------------------------------------- function-scoped binding
+
+    /// The temporary a function-scoped pattern binding binds: marked with a
+    /// fresh `Desugar` expansion (so no user name can capture it), logged for
+    /// its consumer, and its name hoisted to the enclosing function.
+    pub(crate) fn persist_binder(&mut self, sym: Symbol, span: Span) -> BinderId {
+        let expn = self.b.expansion(hir_lang::Expansion {
+            kind: hir_lang::ExpnKind::Desugar,
+            name: self.hoist_sym,
+            call_site: span,
+            parent: hir_lang::ExpnId::ROOT,
+            def_site: hir_lang::ExpnId::ROOT,
+        });
+        self.at(span);
+        let tmp = self.binder(Name::marked(sym, expn), BinderKind::Local, true);
+        self.hoist_name(sym, span);
+        self.persist.push(Persist { tmp, sym, span });
+        tmp
+    }
+
+    /// `name = tmp;` for each binding, in order.
+    pub(crate) fn persist_assigns(&mut self, binds: &[Persist], out: &mut Vec<StmtId>) {
+        for p in binds {
+            let target = self.name_expr(p.sym, p.span);
+            self.at(p.span);
+            let value = self.b.use_binder(p.tmp);
+            self.nodes += 2;
+            let assign = self.ex(Expr::Assign {
+                target,
+                op: None,
+                value,
+            });
+            out.push(self.st(Stmt::Expr(assign)));
+        }
+    }
+
+    /// `{ name = tmp; ...; body }`, or `body` without bindings.
+    pub(crate) fn with_assigns(&mut self, binds: &[Persist], body: ExprId, span: Span) -> ExprId {
+        if binds.is_empty() {
+            return body;
+        }
+        let mut stmts = Vec::with_capacity(binds.len());
+        self.persist_assigns(binds, &mut stmts);
+        self.at(span);
+        let list = self.list(&stmts);
+        self.ex(Expr::Block(hir_lang::Block {
+            stmts: list,
+            tail: Some(body),
+            label: None,
+            is_unsafe: false,
+        }))
+    }
+
+    // ----------------------------------------------------------- attributes
+
+    /// Lowers attribute nodes (data only: literal and name arguments) into the
+    /// pool; returns their range.
+    fn lower_attrs(&mut self, elems: &[&'t Element<K>]) -> AttrRange {
+        let start = u32::try_from(self.attr_pool.len()).unwrap_or(u32::MAX);
+        let mut kids = Vec::new();
+        let mut arg_kids = Vec::new();
+        let mut args_sel: Vec<&'t Element<K>> = Vec::new();
+        for &e in elems {
+            let Element::Node(n) = e else { continue };
+            let Some(Arch::Attr { name, args }) = self.m.rule_for(n.kind()).copied() else {
+                continue;
+            };
+            pick::collect_kids(n, self.labeler, self.m, &mut kids, None);
+            let Some(name_elem) = pick::single(name, &kids, self.m) else {
+                self.report(ProblemKind::MissingField { field: "name" }, e.span());
+                continue;
+            };
+            let name_span = name_elem.span();
+            let sym = match name_elem {
+                Element::Token(_) => self.name_of(name_elem).map(|(s, _)| s),
+                Element::Node(_) => {
+                    let text = self.text_of(name_span).trim();
+                    Some(self.intern(text))
+                }
+            }
+            .unwrap_or(self.empty);
+            args_sel.clear();
+            pick::list(args, &kids, self.m, &mut args_sel);
+            let mut out_args: Vec<hir_lang::AttrArg> = Vec::new();
+            for &a in &args_sel {
+                let arg_rule = match a {
+                    Element::Node(an) => self.m.rule_for(an.kind()).copied(),
+                    Element::Token(_) => None,
+                };
+                if let (Some(Arch::AttrArg { key, value }), Element::Node(an)) = (arg_rule, a) {
+                    pick::collect_kids(an, self.labeler, self.m, &mut arg_kids, None);
+                    let key = pick::single(key, &arg_kids, self.m)
+                        .and_then(|k| self.name_of(k))
+                        .map(|(s, sp)| hir_lang::Ident::new(s, sp));
+                    let value = pick::single(value, &arg_kids, self.m);
+                    let value = match value {
+                        Some(v) => match self.attr_value(v) {
+                            Some(v) => Some(v),
+                            None => continue,
+                        },
+                        None => None,
+                    };
+                    if key.is_none() && value.is_none() {
+                        continue;
+                    }
+                    out_args.push(hir_lang::AttrArg { key, value });
+                } else if let Some(v) = self.attr_value(a) {
+                    out_args.push(hir_lang::AttrArg {
+                        key: None,
+                        value: Some(v),
+                    });
+                }
+            }
+            let list = self.list(&out_args);
+            self.attr_pool.push(hir_lang::Attr {
+                name: hir_lang::Ident::new(sym, name_span),
+                args: list,
+            });
+        }
+        let end = u32::try_from(self.attr_pool.len()).unwrap_or(u32::MAX);
+        (start, end.saturating_sub(start))
+    }
+
+    /// An attribute argument value: a literal or a name; anything else is
+    /// reported and left out.
+    fn attr_value(&mut self, e: &'t Element<K>) -> Option<hir_lang::AttrValue> {
+        match e {
+            Element::Token(t) => {
+                let span = t.span();
+                match self.m.role_for(t.kind()) {
+                    Some(TokenRole::Name | TokenRole::Var { .. }) => {
+                        let (sym, _) = self.token_name(span, TokenRole::Name);
+                        Some(hir_lang::AttrValue::Name(hir_lang::Ident::new(sym, span)))
+                    }
+                    Some(
+                        role @ (TokenRole::Int
+                        | TokenRole::Float
+                        | TokenRole::Number
+                        | TokenRole::Str(_)
+                        | TokenRole::RawStr
+                        | TokenRole::Heredoc(_)
+                        | TokenRole::Char(_)
+                        | TokenRole::Bytes(_)
+                        | TokenRole::True
+                        | TokenRole::False
+                        | TokenRole::Null),
+                    ) => match self.token_lit(role, span, false) {
+                        token::Decoded::Lit(l) => Some(hir_lang::AttrValue::Lit(l)),
+                        token::Decoded::Bad => None,
+                    },
+                    _ => {
+                        self.report(ProblemKind::AttributeArgument, span);
+                        None
+                    }
+                }
+            }
+            Element::Node(n) => {
+                let span = n.span();
+                match self.m.rule_for(n.kind()).copied() {
+                    Some(Arch::Path { .. } | Arch::Segment { .. }) => {
+                        let text = self.text_of(span).trim();
+                        let sym = self.intern(text);
+                        Some(hir_lang::AttrValue::Name(hir_lang::Ident::new(sym, span)))
+                    }
+                    Some(Arch::Pass { .. }) => match self.name_of(e) {
+                        Some((sym, sp)) => {
+                            Some(hir_lang::AttrValue::Name(hir_lang::Ident::new(sym, sp)))
+                        }
+                        None => {
+                            self.report(ProblemKind::AttributeArgument, span);
+                            None
+                        }
+                    },
+                    Some(Arch::Unary { op, operand }) => {
+                        let mut kids = Vec::new();
+                        pick::collect_kids(n, self.labeler, self.m, &mut kids, None);
+                        let op_tok = pick::single(op, &kids, self.m);
+                        let neg = match op_tok {
+                            Some(Element::Token(t)) => {
+                                let text = if self.m.has_op_text() {
+                                    self.text_of(t.span())
+                                } else {
+                                    ""
+                                };
+                                matches!(
+                                    self.m.op(crate::mapping::Fixity::Prefix, t.kind(), text),
+                                    Some(OpSpec::Op(hir_lang::OpKind::Neg))
+                                )
+                            }
+                            _ => false,
+                        };
+                        let num = match pick::single(operand, &kids, self.m) {
+                            Some(Element::Token(t)) => Some(*t),
+                            _ => None,
+                        };
+                        match (
+                            neg,
+                            num.and_then(|t| self.m.role_for(t.kind()).map(|r| (t, r))),
+                        ) {
+                            (
+                                true,
+                                Some((
+                                    t,
+                                    role @ (TokenRole::Int | TokenRole::Float | TokenRole::Number),
+                                )),
+                            ) => match self.token_lit(role, t.span(), true) {
+                                token::Decoded::Lit(l) => Some(hir_lang::AttrValue::Lit(l)),
+                                token::Decoded::Bad => None,
+                            },
+                            _ => {
+                                self.report(ProblemKind::AttributeArgument, span);
+                                None
+                            }
+                        }
+                    }
+                    _ => {
+                        self.report(ProblemKind::AttributeArgument, span);
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Attaches a frame's attributes to the node its value is.
+    pub(crate) fn attach_attrs(&mut self, v: &mut Val, attrs: AttrRange, span: Span) {
+        let (s, l) = (attrs.0 as usize, attrs.1 as usize);
+        let Some(list) = self.attr_pool.get(s..s.saturating_add(l)) else {
+            return;
+        };
+        let list: Vec<hir_lang::Attr> = list.to_vec();
+        let node = match *v {
+            Val::Item(i) => Some(NodeRef::Item(i)),
+            Val::Expr(e) => Some(NodeRef::Expr(e)),
+            Val::Stmt(st) => Some(NodeRef::Stmt(st)),
+            Val::Pat(p) => Some(NodeRef::Pat(p)),
+            Val::Ty(t) => Some(NodeRef::Ty(t)),
+            Val::Path(p) => Some(NodeRef::Path(p)),
+            Val::Field(f, _) => Some(NodeRef::Field(f)),
+            Val::Variant(var) => Some(NodeRef::Variant(var)),
+            Val::Arg(a) => Some(NodeRef::Expr(a.value)),
+            Val::Param(p, sp, _) => {
+                *v = Val::Param(p, sp, attrs);
+                return;
+            }
+            Val::Spill(ss, sl) => {
+                let (ss, sl) = (ss as usize, sl as usize);
+                let nodes: Vec<NodeRef> = self
+                    .spill
+                    .get(ss..ss.saturating_add(sl))
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|slot| match slot.v {
+                        Val::Item(i) => Some(NodeRef::Item(i)),
+                        Val::Stmt(st) => Some(NodeRef::Stmt(st)),
+                        Val::Expr(e) => Some(NodeRef::Expr(e)),
+                        _ => None,
+                    })
+                    .collect();
+                for n in nodes {
+                    self.b.attach(n, &list);
+                }
+                return;
+            }
+            _ => None,
+        };
+        match node {
+            Some(n) => self.b.attach(n, &list),
+            None => self.report(ProblemKind::MisplacedAttribute, span),
+        }
     }
 
     /// `body`, or `{ hoisted lets; body }` when there are hoisted names.

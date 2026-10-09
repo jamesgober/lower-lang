@@ -58,6 +58,25 @@ pub enum TokenRole {
     Number,
     /// A string literal, quotes included in the token.
     Str(Escapes),
+    /// A raw string literal, taken verbatim: optional ASCII prefix letters
+    /// (`r`, `R`, `br`), optional `#` fences, then one quote character (`"`,
+    /// `'`, or `` ` ``), or a tripled one (`"""`, Python), closed by the same
+    /// quote(s) and the same number of `#`s. Rust `r#"a "b""#`, Python
+    /// `r'\d+'`. Malformed fences are an
+    /// [`InvalidLiteral`](crate::ProblemKind::InvalidLiteral).
+    RawStr,
+    /// A PHP heredoc (`Standard` escapes) or nowdoc (`None`) as one token:
+    /// `<<<ID` (or `<<<"ID"`, `<<<'ID'`), a newline, the body lines, and the
+    /// closing identifier on its own line. Per PHP 7.3+, the whitespace before
+    /// the closing identifier is removed from every body line (a line
+    /// indented less, or tabs mixed with spaces, is an
+    /// [`InvalidLiteral`](crate::ProblemKind::InvalidLiteral)), and the newline
+    /// before the closing identifier is not part of the string. A heredoc
+    /// with interpolation is an [`Interp`](crate::Arch::Interp) node instead.
+    Heredoc(Escapes),
+    /// A literal piece of an [interpolated string](crate::Arch::Interp): the
+    /// text between embedded expressions, without quotes; escapes decoded.
+    StrPart(Escapes),
     /// A character literal, quotes included.
     Char(Escapes),
     /// A byte-string literal, quotes (and a leading `b`) included.
@@ -254,9 +273,105 @@ pub enum PlaceArgs {
     Places,
 }
 
+/// Where `_` may separate the digits of a number.
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::Separators;
+///
+/// assert_eq!(Separators::default(), Separators::Anywhere);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Separators {
+    /// After the first digit, anywhere and repeated (`1_000`, `1__0`, `10_`;
+    /// Rust, Kraken).
+    #[default]
+    Anywhere,
+    /// Only between two digits of the number's radix: `1_000` and `0xFF_FF`,
+    /// but not `1__0`, `10_`, `0x_FF`, or `1_.5` (PHP 7.4+, JavaScript; Python
+    /// also accepts `0x_FF`, which this rejects).
+    BetweenDigits,
+    /// Never (C, PHP before 7.4).
+    None,
+}
+
+/// What a leading `0` followed by more digits means (`0777`).
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::LegacyOctal;
+///
+/// assert_eq!(LegacyOctal::default(), LegacyOctal::Decimal);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LegacyOctal {
+    /// Decimal: `0777` is 777 (Rust, Kraken).
+    #[default]
+    Decimal,
+    /// Octal: `0777` is 511, and `08` is invalid (C, PHP, JavaScript sloppy
+    /// mode).
+    Octal,
+    /// An error (Python 3: write `0o777`); `0`, `00`, and `0.5` stay valid.
+    Error,
+}
+
+/// How number literals are spelled and decoded: the literal decoding table.
+///
+/// Raw strings, heredocs, nowdocs, and interpolation pieces are token roles
+/// ([`TokenRole::RawStr`], [`TokenRole::Heredoc`], [`TokenRole::StrPart`]); an
+/// integer too large for 64 bits follows [`LangPolicy::overflow`] (see
+/// [`LangPolicy`]).
+///
+/// `#[non_exhaustive]`: start from [`Literals::default`] and assign fields.
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::{LegacyOctal, Literals, Separators};
+///
+/// let mut php = Literals::default();
+/// php.separators = Separators::BetweenDigits;
+/// php.legacy_octal = LegacyOctal::Octal;
+/// php.hex_floats = false;
+/// assert!(Literals::default().hex_floats);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct Literals {
+    /// Digit separators.
+    pub separators: Separators,
+    /// A leading zero.
+    pub legacy_octal: LegacyOctal,
+    /// Whether hexadecimal floating-point literals (`0x1.8p3` = 12.0, `0x1p-2`
+    /// = 0.25) are accepted (C, Java, Rust's `hexf`); they are decoded with
+    /// correct rounding to the nearest `f64`, subnormals included.
+    pub hex_floats: bool,
+}
+
+impl Default for Literals {
+    fn default() -> Self {
+        Self {
+            separators: Separators::Anywhere,
+            legacy_octal: LegacyOctal::Decimal,
+            hex_floats: true,
+        }
+    }
+}
+
 /// Language-wide lowering policies.
 ///
-/// `#[non_exhaustive]`: start from [`LangPolicy::default`] and assign fields.
+/// `#[non_exhaustive]`: start from [`LangPolicy::default`] (or
+/// [`LangPolicy::php`]) and assign fields.
+///
+/// An unsuffixed integer literal follows the overflow policy: with
+/// [`Overflow::Promote`] (PHP, whose integers are 64-bit signed) a value
+/// above `i64::MAX` is the `f64` nearest to it (`9223372036854775808` and
+/// `0xFFFF_FFFF_FFFF_FFFF` are floats, as in PHP); otherwise a decimal value
+/// beyond `u64` is an exact big integer, and a non-decimal one is converted
+/// to its exact decimal digits (up to 1,024 digits; longer is an
+/// [`InvalidLiteral`](crate::ProblemKind::InvalidLiteral)).
 ///
 /// # Examples
 ///
@@ -298,6 +413,57 @@ pub struct LangPolicy {
     pub ident_patterns: IdentPatterns,
     /// Which arguments are passed as places.
     pub place_args: PlaceArgs,
+    /// PHP scoping: the variables a `for-each` binds (every template pattern
+    /// hole) and the variable a `catch` binds belong to the enclosing
+    /// function (or module body), so they keep their last value after the
+    /// loop or handler. Each such pattern binds hygienic temporaries, which
+    /// are assigned to the function-scoped names right after the pattern
+    /// matches. A binding that cannot be hoisted this way (a by-reference
+    /// binding, a hole the template uses twice) is reported
+    /// ([`CannotHoist`](crate::ProblemKind::CannotHoist)) and stays scoped.
+    pub function_scoped_bindings: bool,
+    /// How number literals are spelled.
+    pub literals: Literals,
+}
+
+impl LangPolicy {
+    /// PHP and Mox: integers promote to float on overflow (OPS §2), any
+    /// function may throw, a `yield` makes a generator, assignment declares
+    /// variables for the whole function, every place argument is passed as a
+    /// place, `foreach` and `catch` variables are function-scoped, and
+    /// numbers use PHP's spelling (`_` between digits, `0777` octal, no hex
+    /// floats).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::Overflow;
+    /// use lower_lang::{LangPolicy, LegacyOctal, PlaceArgs};
+    ///
+    /// let php = LangPolicy::php();
+    /// assert_eq!(php.overflow, Overflow::Promote);
+    /// assert!(php.implicit_locals && php.function_scoped_bindings);
+    /// assert_eq!(php.place_args, PlaceArgs::Places);
+    /// assert_eq!(php.literals.legacy_octal, LegacyOctal::Octal);
+    /// assert!(!LangPolicy::default().function_scoped_bindings);
+    /// ```
+    #[must_use]
+    pub fn php() -> Self {
+        Self {
+            overflow: Overflow::Promote,
+            throws: EffectMode::Always,
+            yields: EffectMode::Inferred,
+            implicit_locals: true,
+            place_args: PlaceArgs::Places,
+            function_scoped_bindings: true,
+            literals: Literals {
+                separators: Separators::BetweenDigits,
+                legacy_octal: LegacyOctal::Octal,
+                hex_floats: false,
+            },
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for LangPolicy {
@@ -313,6 +479,8 @@ impl Default for LangPolicy {
             implicit_locals: false,
             ident_patterns: IdentPatterns::Ident,
             place_args: PlaceArgs::Marked,
+            function_scoped_bindings: false,
+            literals: Literals::default(),
         }
     }
 }
@@ -329,6 +497,37 @@ impl Default for LangPolicy {
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NameRef(pub(crate) u32);
+
+/// How the pieces of an [interpolated string](crate::Arch::Interp) become one
+/// string.
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::{Join, MappingBuilder};
+///
+/// let mut b = MappingBuilder::<u8>::new();
+/// let concat = b.name("mox.concat");
+/// // "a{$x}b" → mox.concat(mox.concat("a", x), "b")
+/// let fold = Join::Fold(concat);
+/// assert_ne!(fold, Join::Call(concat));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Join {
+    /// A host function of two arguments, folded left:
+    /// `concat(concat(p0, p1), p2)` (PHP's `.`).
+    Fold(NameRef),
+    /// One call of a host function with every piece as an argument:
+    /// `interp(p0, p1, p2)` (one LSB call, no intermediate strings).
+    Call(NameRef),
+    /// A template: with exactly two expression holes it is folded left like
+    /// `Fold`; with exactly one argument-list hole it receives every piece at
+    /// once. Any other hole shape is refused by
+    /// [`build`](MappingBuilder::build)
+    /// ([`MappingError::BadJoin`]).
+    Template(TemplateId),
+}
 
 /// What an operator token lowers to.
 ///
@@ -502,6 +701,19 @@ pub enum MappingError {
     },
     /// A table outgrew its index type.
     TooLarge,
+    /// Rule `rule` joins an interpolated string with a template whose holes
+    /// are neither two expressions nor one argument list.
+    BadJoin {
+        /// The rule's registration index.
+        rule: usize,
+    },
+    /// A text-keyed operator entry has an empty text.
+    EmptyOperatorText {
+        /// The operator's position.
+        fixity: Fixity,
+        /// Its registration index in the text table.
+        index: usize,
+    },
 }
 
 impl fmt::Display for MappingError {
@@ -538,6 +750,13 @@ impl fmt::Display for MappingError {
                 )
             }
             Self::TooLarge => f.write_str("a mapping table outgrew its index type"),
+            Self::BadJoin { rule } => write!(
+                f,
+                "rule {rule}: an interpolation template needs two expression holes or one argument-list hole"
+            ),
+            Self::EmptyOperatorText { fixity, index } => {
+                write!(f, "{fixity:?} operator text {index} is empty")
+            }
         }
     }
 }
@@ -592,6 +811,13 @@ pub struct Mapping<K> {
     pub(crate) prefix: Vec<(K, OpSpec)>,
     pub(crate) binary: Vec<(K, OpSpec)>,
     pub(crate) postfix: Vec<(K, OpSpec)>,
+    /// Operator tables keyed by the token's text, consulted when the kind
+    /// table has no entry (lexers with one generic operator kind).
+    pub(crate) prefix_text: Vec<(Box<str>, OpSpec)>,
+    pub(crate) binary_text: Vec<(Box<str>, OpSpec)>,
+    pub(crate) postfix_text: Vec<(Box<str>, OpSpec)>,
+    /// Kinds with an `Attr` rule, sorted: invisible to other picks.
+    pub(crate) attr_kinds: Vec<K>,
     pub(crate) templates: Vec<Template>,
     pub(crate) template_names: Vec<u32>,
     pub(crate) hole_picks: Vec<Pick<K>>,
@@ -704,13 +930,31 @@ impl<K: Copy + Ord> Mapping<K> {
         (start, end)
     }
 
-    pub(crate) fn op(&self, fixity: Fixity, kind: &K) -> Option<OpSpec> {
-        let table = match fixity {
-            Fixity::Prefix => &self.prefix,
-            Fixity::Binary => &self.binary,
-            Fixity::Postfix => &self.postfix,
+    /// The operator spec of a token: by kind first, then by its text.
+    pub(crate) fn op(&self, fixity: Fixity, kind: &K, text: &str) -> Option<OpSpec> {
+        let (table, texts) = match fixity {
+            Fixity::Prefix => (&self.prefix, &self.prefix_text),
+            Fixity::Binary => (&self.binary, &self.binary_text),
+            Fixity::Postfix => (&self.postfix, &self.postfix_text),
         };
-        find(table, kind).copied()
+        find(table, kind).copied().or_else(|| {
+            if texts.is_empty() {
+                return None;
+            }
+            texts
+                .binary_search_by(|(t, _)| (**t).cmp(text))
+                .ok()
+                .and_then(|i| texts.get(i))
+                .map(|(_, s)| *s)
+        })
+    }
+
+    /// Whether the operator tables are keyed by text at all (so a lookup
+    /// needs the token's text).
+    pub(crate) fn has_op_text(&self) -> bool {
+        !(self.prefix_text.is_empty()
+            && self.binary_text.is_empty()
+            && self.postfix_text.is_empty())
     }
 
     pub(crate) fn root_for(&self, kind: &K) -> Option<PathRoot> {
@@ -736,6 +980,9 @@ impl<K: Ord> KindSets<K> for Mapping<K> {
     }
     fn is_container(&self, kind: &K) -> bool {
         self.containers.binary_search(kind).is_ok()
+    }
+    fn is_attr(&self, kind: &K) -> bool {
+        !self.attr_kinds.is_empty() && self.attr_kinds.binary_search(kind).is_ok()
     }
 }
 
@@ -808,6 +1055,10 @@ impl<K: Copy + Ord> MappingBuilder<K> {
                 prefix: Vec::new(),
                 binary: Vec::new(),
                 postfix: Vec::new(),
+                prefix_text: Vec::new(),
+                binary_text: Vec::new(),
+                postfix_text: Vec::new(),
+                attr_kinds: Vec::new(),
                 templates: Vec::new(),
                 template_names: Vec::new(),
                 hole_picks: Vec::new(),
@@ -1025,6 +1276,61 @@ impl<K: Copy + Ord> MappingBuilder<K> {
         self
     }
 
+    /// A prefix operator found by its token's **text** (`"-"`, `"!"`), for a
+    /// lexer that gives every operator one generic kind. A kind entry for the
+    /// token's kind ([`prefix_op`](Self::prefix_op)) wins over a text entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::OpKind;
+    /// use lower_lang::OpSpec;
+    ///
+    /// let mut b = lower_lang::MappingBuilder::<u8>::new();
+    /// b.prefix_op_text("-", OpSpec::Op(OpKind::Neg));
+    /// assert!(b.build().is_ok());
+    /// ```
+    pub fn prefix_op_text(&mut self, text: &str, spec: OpSpec) -> &mut Self {
+        self.m.prefix_text.push((text.into(), spec));
+        self
+    }
+
+    /// A binary operator found by its token's text (`"+"`, `"."`, `"+="`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::OpKind;
+    /// use lower_lang::OpSpec;
+    ///
+    /// let mut b = lower_lang::MappingBuilder::<u8>::new();
+    /// b.binary_op_text("+", OpSpec::Op(OpKind::Add))
+    ///     .binary_op_text("+=", OpSpec::Compound(OpKind::Add));
+    /// assert!(b.build().is_ok());
+    /// ```
+    pub fn binary_op_text(&mut self, text: &str, spec: OpSpec) -> &mut Self {
+        self.m.binary_text.push((text.into(), spec));
+        self
+    }
+
+    /// A postfix operator found by its token's text (`"++"`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{templates, OpSpec};
+    ///
+    /// let mut b = lower_lang::MappingBuilder::<u8>::new();
+    /// let inc = b.template(templates::post_increment())?;
+    /// b.postfix_op_text("++", OpSpec::Template(inc));
+    /// assert!(b.build().is_ok());
+    /// # Ok::<(), lower_lang::MappingError>(())
+    /// ```
+    pub fn postfix_op_text(&mut self, text: &str, spec: OpSpec) -> &mut Self {
+        self.m.postfix_text.push((text.into(), spec));
+        self
+    }
+
     /// Stores a host or intrinsic name for [`OpSpec::Extern`] and
     /// [`OpSpec::Intrinsic`]; interned per lowering.
     ///
@@ -1181,9 +1487,11 @@ impl<K: Copy + Ord> MappingBuilder<K> {
     /// # Errors
     ///
     /// A [`MappingError`]: a required field without a pick, a kind with two
-    /// entries in a one-entry table, an unknown template or a wrong number of
-    /// template picks, or an operator spec that cannot apply where it is
-    /// registered.
+    /// entries in a one-entry table (or a text with two entries in a text
+    /// operator table), an unknown template or a wrong number of template
+    /// picks, an operator spec that cannot apply where it is registered, an
+    /// empty operator text, or an interpolation join template of the wrong
+    /// shape.
     ///
     /// # Examples
     ///
@@ -1211,6 +1519,37 @@ impl<K: Copy + Ord> MappingBuilder<K> {
                     });
                 }
             }
+            if let Arch::Interp {
+                join: Join::Template(id),
+                ..
+            } = rule.arch
+            {
+                let t = m
+                    .templates
+                    .get(id.index())
+                    .ok_or(MappingError::UnknownTemplate {
+                        template: id.index(),
+                    })?;
+                let fold = t.holes.len() == 2 && t.holes.iter().all(|h| h.kind == HoleKind::Expr);
+                let all = t.holes.len() == 1 && t.holes.iter().all(|h| h.kind == HoleKind::Args);
+                if !fold && !all {
+                    return Err(MappingError::BadJoin { rule: i });
+                }
+            }
+        }
+        for (fixity, table) in [
+            (Fixity::Prefix, &m.prefix_text),
+            (Fixity::Binary, &m.binary_text),
+            (Fixity::Postfix, &m.postfix_text),
+        ] {
+            for (index, (text, spec)) in table.iter().enumerate() {
+                if text.is_empty() {
+                    return Err(MappingError::EmptyOperatorText { fixity, index });
+                }
+                if !op_fits(*spec, fixity, &m.templates) {
+                    return Err(MappingError::BadOperator { fixity, index });
+                }
+            }
         }
         for (fixity, table) in [
             (Fixity::Prefix, &m.prefix),
@@ -1230,6 +1569,22 @@ impl<K: Copy + Ord> MappingBuilder<K> {
         sort_unique(&mut m.prefix, "prefix operator")?;
         sort_unique(&mut m.binary, "binary operator")?;
         sort_unique(&mut m.postfix, "postfix operator")?;
+        sort_unique_text(&mut m.prefix_text, "prefix operator text")?;
+        sort_unique_text(&mut m.binary_text, "binary operator text")?;
+        sort_unique_text(&mut m.postfix_text, "postfix operator text")?;
+        let mut attrs: Vec<K> = m
+            .by_kind
+            .iter()
+            .filter(|(_, r)| {
+                m.rules
+                    .get(*r as usize)
+                    .is_some_and(|r| matches!(r.arch, Arch::Attr { .. }))
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        attrs.sort();
+        attrs.dedup();
+        m.attr_kinds = attrs;
         m.containers.sort();
         m.containers.dedup();
         m.skips.sort();
@@ -1276,6 +1631,27 @@ fn sort_unique<K: Ord + Copy, V>(
     Ok(())
 }
 
+/// Sorts a text-keyed table, refusing a text with two entries.
+fn sort_unique_text<V>(
+    table: &mut [(Box<str>, V)],
+    name: &'static str,
+) -> Result<(), MappingError> {
+    let mut order: Vec<(&str, usize)> = table
+        .iter()
+        .enumerate()
+        .map(|(i, (t, _))| (&**t, i))
+        .collect();
+    order.sort_unstable();
+    if let Some(w) = order.windows(2).find(|w| w[0].0 == w[1].0) {
+        return Err(MappingError::DuplicateKind {
+            table: name,
+            index: w[1].1,
+        });
+    }
+    table.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(())
+}
+
 /// Whether `spec` can apply at `fixity`.
 fn op_fits(spec: OpSpec, fixity: Fixity, templates: &[Template]) -> bool {
     let arity = fixity.arity();
@@ -1306,6 +1682,9 @@ fn missing_field<K>(arch: &Arch<K>) -> Option<&'static str> {
         | Arch::Unsupported
         | Arch::GlobalDecl { .. }
         | Arch::MixinUse { .. }
+        | Arch::UseTree { .. }
+        | Arch::Interp { .. }
+        | Arch::AttrArg { .. }
         | Arch::FieldDecl { .. }
         | Arch::Tuple { .. }
         | Arch::Array { .. }
@@ -1349,6 +1728,8 @@ fn missing_field<K>(arch: &Arch<K>) -> Option<&'static str> {
         | Arch::FieldPat { name, .. }
         | Arch::FieldInit { name, .. } => need(&[("name", name.is_absent())]),
         Arch::Import { path, .. } => need(&[("path", path.is_absent())]),
+        Arch::MixinRule { method, .. } => need(&[("method", method.is_absent())]),
+        Arch::Attr { name, .. } => need(&[("name", name.is_absent())]),
         Arch::Impl { self_ty, .. } => need(&[("self_ty", self_ty.is_absent())]),
         Arch::Alias { name, ty, .. } | Arch::AssocBinding { name, ty } => {
             need(&[("name", name.is_absent()), ("ty", ty.is_absent())])

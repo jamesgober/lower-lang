@@ -1,14 +1,33 @@
 //! A Mox-flavoured language (PHP-like: `$variables`, `foreach`, by-reference
 //! parameters, implicit locals, `use` captures, `->` members, classes with
-//! mixins, try/catch) whose trees are built directly with syntax-lang's
-//! `Builder`, with a mapping that exercises the dynamic-language archetypes.
+//! mixins and trait rules, try/catch, interpolated strings and heredocs,
+//! group `use`, attributes) whose trees are built directly with
+//! syntax-lang's `Builder`, with a mapping that exercises the
+//! dynamic-language archetypes under PHP's lowering policy.
+//!
+//! The tree shapes this mapping expects (what a Mox lexer and parser
+//! deliver):
+//!
+//! - `"Hello {$name}!"`: a `DqString` node of `DQuote`, `StrPart("Hello ")`,
+//!   `CurlyOpen`, `Var($name)`, `CurlyClose`, `StrPart("!")`, `DQuote`;
+//!   `"$name"` has no curlies; `{$a['k']}` holds an `Index` node.
+//! - A heredoc with interpolation: a `HeredocStr` node of `HeredocOpen`
+//!   (`<<<EOT` + newline), the pieces, and `HeredocClose` (the indented
+//!   `EOT`); a nowdoc is one `Nowdoc` token.
+//! - `use App\Models\{User, Post as P};`: a `UseStmt` node of `UseKw`, a
+//!   `UseDecl` (`NsName` prefix, `NsSep`, a `UseGroup` of `UseDecl`s), `Semi`.
+//! - `use A, B { A::hi insteadof B; B::hi as protected greet; }`: a
+//!   `MixinUse` node whose `TraitRule` children are the rules.
+//! - `#[Route("/x", methods: GET)]`: an `AttrGroup` child of the annotated
+//!   declaration, holding `Attr` nodes (with `AttrArg` nodes for named
+//!   arguments).
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
-use hir_lang::{OpKind, Overflow};
+use hir_lang::OpKind;
 use lower_lang::{
-    Arch, EffectMode, Escapes, LangPolicy, Mapping, MappingBuilder, Modifier, OpSpec, Pick,
-    PlaceArgs, TokenRole, templates,
+    Arch, Escapes, Join, LangPolicy, Mapping, MappingBuilder, Modifier, OpSpec, Pick, TokenRole,
+    templates,
 };
 use syntax_lang::{Builder, Node, Span, Token, TokenKind};
 
@@ -53,6 +72,16 @@ pub enum M {
     While,
     Paren,
     Error,
+    DqString,
+    HeredocStr,
+    UseStmt,
+    UseDecl,
+    UseGroup,
+    NsName,
+    TraitRule,
+    Attr,
+    AttrArg,
+    AttrGroup,
     // tokens
     Var,
     Ident,
@@ -98,6 +127,21 @@ pub enum M {
     RBracket,
     Comma,
     Semi,
+    StrPart,
+    DQuote,
+    CurlyOpen,
+    CurlyClose,
+    HeredocOpen,
+    HeredocClose,
+    Nowdoc,
+    NsSep,
+    UseOpen,
+    UseClose,
+    ColonColon,
+    InsteadofKw,
+    Protected,
+    HashBracket,
+    Colon,
     Space,
 }
 
@@ -173,13 +217,9 @@ pub fn mox_mapping() -> Mapping<M> {
     };
     let concat = b.name("mox.concat");
 
-    let mut policy = LangPolicy::default();
-    policy.overflow = Overflow::Promote;
-    policy.throws = EffectMode::Always;
-    policy.yields = EffectMode::Inferred;
-    policy.implicit_locals = true;
-    policy.place_args = PlaceArgs::Places;
-    b.policy(policy);
+    // PHP's lowering policy: promotion to float, implicit locals, place
+    // arguments, function-scoped foreach/catch variables, PHP number spelling.
+    b.policy(LangPolicy::php());
 
     b.node(
         M::File,
@@ -360,6 +400,85 @@ pub fn mox_mapping() -> Mapping<M> {
         M::MixinUse,
         Arch::MixinUse {
             mixins: Pick::AllKind(M::Ident),
+            rules: Pick::AllKind(M::TraitRule),
+        },
+    );
+    // `A::hi insteadof B;` / `B::hi as protected greet;` / `hi as private;`
+    b.node_when(
+        M::TraitRule,
+        Pick::Kind(M::ColonColon),
+        Arch::MixinRule {
+            from: Pick::Before(M::ColonColon),
+            method: Pick::After(M::ColonColon),
+            insteadof: Pick::AllAfter(M::InsteadofKw),
+            alias: Pick::AllAfter(M::As),
+        },
+    );
+    b.node(
+        M::TraitRule,
+        Arch::MixinRule {
+            from: Pick::Absent,
+            method: Pick::Nth(0),
+            insteadof: Pick::AllAfter(M::InsteadofKw),
+            alias: Pick::AllAfter(M::As),
+        },
+    );
+    // Strings with interpolation, joined with PHP's `.` (`mox.concat`).
+    b.node(
+        M::DqString,
+        Arch::Interp {
+            parts: Pick::All,
+            close: Pick::Absent,
+            join: Join::Fold(concat),
+        },
+    );
+    b.node(
+        M::HeredocStr,
+        Arch::Interp {
+            parts: Pick::Between(M::HeredocOpen, M::HeredocClose),
+            close: Pick::Kind(M::HeredocClose),
+            join: Join::Fold(concat),
+        },
+    );
+    // `use App\Models\{User, Post as P};`
+    b.node(
+        M::UseStmt,
+        Arch::Pass {
+            inner: Pick::Kind(M::UseDecl),
+        },
+    );
+    b.node(
+        M::UseDecl,
+        Arch::UseTree {
+            path: Pick::Nth(0),
+            alias: Pick::After(M::As),
+            children: Pick::Kind(M::UseGroup),
+        },
+    );
+    b.node(
+        M::NsName,
+        Arch::Path {
+            segments: Pick::All,
+            global: Pick::Absent,
+            qself: Pick::Absent,
+            qtrait: Pick::Absent,
+        },
+    );
+    b.container(M::UseGroup);
+    // `#[Route("/x", methods: GET)]`
+    b.container(M::AttrGroup);
+    b.node(
+        M::Attr,
+        Arch::Attr {
+            name: Pick::Nth(0),
+            args: Pick::Between(M::LParen, M::RParen),
+        },
+    );
+    b.node(
+        M::AttrArg,
+        Arch::AttrArg {
+            key: Pick::Nth(0),
+            value: Pick::After(M::Colon),
         },
     );
     b.node(
@@ -400,18 +519,36 @@ pub fn mox_mapping() -> Mapping<M> {
     b.error(M::Error);
     b.skip(M::Comma);
     b.skip(M::Semi);
+    for k in [
+        M::DQuote,
+        M::CurlyOpen,
+        M::CurlyClose,
+        M::NsSep,
+        M::UseOpen,
+        M::UseClose,
+        M::HashBracket,
+        M::RBracket,
+        M::Protected,
+        M::Public,
+        M::Private,
+    ] {
+        b.skip(k);
+    }
 
     b.token(M::Var, TokenRole::Var { sigil: 1 });
     b.token(M::Ident, TokenRole::Name);
     b.token(M::Num, TokenRole::Number);
     b.token(M::Str, TokenRole::Str(Escapes::Standard));
     b.token(M::SqStr, TokenRole::Str(Escapes::Quotes));
+    b.token(M::StrPart, TokenRole::StrPart(Escapes::Standard));
+    b.token(M::Nowdoc, TokenRole::Heredoc(Escapes::None));
     b.token(M::True, TokenRole::True);
     b.token(M::Null, TokenRole::Null);
 
     b.modifier(M::Amp, Modifier::Ref);
     b.modifier(M::Public, Modifier::Public);
     b.modifier(M::Private, Modifier::Private);
+    b.modifier(M::Protected, Modifier::Protected);
     b.modifier(M::StaticKw, Modifier::Static);
 
     b.binary_op(M::Eq, OpSpec::Assign);

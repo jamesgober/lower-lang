@@ -13,6 +13,98 @@
 
 ---
 
+## [0.3.0] - 2026-10-08
+
+PHP and Python semantics before the Mox demo (ISSUES P15): PHP scoping,
+interpolated strings and heredocs, a literal decoding table, text-keyed
+operator tables, nested `use` trees, trait conflict rules, and attributes.
+
+### Breaking
+
+- `Arch::MixinUse` has a second field, `rules` (the trait conflict rules);
+  mappings that build it must add `rules: Pick::Absent` (or a pick of
+  `MixinRule` nodes).
+- A hoisted `Arch::Let` (`hoist: true`) with a destructuring pattern is now
+  hoisted (temporaries bound by the pattern, then assigned to
+  function-level names); 0.2 silently lowered it as an ordinary scoped
+  `let`.
+- Integer literals beyond 64 bits follow `LangPolicy::overflow`: with
+  `Overflow::Promote` (PHP) every integer above `i64::MAX` (including
+  `9223372036854775808` and `0xFFFF_FFFF_FFFF_FFFF`) lowers to the nearest
+  float instead of an integer or big-integer literal; otherwise binary,
+  octal, and hex integers beyond 64 bits are exact big integers (0.2 reported
+  them as invalid).
+- Number spelling is now a policy (`LangPolicy::literals`). The default
+  table keeps 0.2's spelling (separators anywhere, `0777` decimal) and adds
+  hexadecimal floats (`0x1.8p3`), which 0.2 rejected.
+- Nodes whose kind has an `Arch::Attr` rule (and containers holding only
+  such nodes) are no longer children for picks; positional picks of a node
+  with attributes count without them.
+
+### Added
+
+- `LangPolicy::php()`, the PHP and Mox preset (promote-to-float, throws
+  always, inferred generators, implicit locals, place arguments,
+  function-scoped bindings, PHP number spelling).
+- `LangPolicy::function_scoped_bindings`: `for-each` template pattern holes
+  and `catch` names belong to the enclosing function (PHP). Each binding is
+  a hygienic temporary (one `Desugar` expansion named `hoist` per binding)
+  assigned to the function-scoped name right after the pattern matches; any
+  pattern shape works. A binding that cannot be hoisted (by reference, a hole
+  the template binds twice, a binding site cut by the depth budget) is
+  reported as `ProblemKind::CannotHoist { reason: HoistBlocker }` and stays
+  scoped.
+- `Arch::Interp { parts, close, join }` for interpolated strings and
+  heredocs delivered in segments (`"Hello {$name}"`, `"$name"`,
+  `"{$a['k']}"`), with `Join::{Fold, Call, Template}`; a heredoc's `close`
+  marker strips its indentation from every line (PHP 7.3+; a line indented
+  less, or starting with an embedded expression, is an `InvalidLiteral`);
+  empty text pieces are left out of the join. The expected CST
+  shapes are documented in `tests/support/mox.rs`.
+- `TokenRole::RawStr` (Rust `r#"…"#`, Python `r'…'` and triple-quoted raw
+  strings), `TokenRole::Heredoc(Escapes)` (heredoc and nowdoc tokens, PHP
+  7.3 indentation stripping, final newline dropped), and
+  `TokenRole::StrPart(Escapes)` (interpolation pieces).
+- The literal decoding table `Literals { separators, legacy_octal,
+  hex_floats }` with `Separators::{Anywhere, BetweenDigits, None}` and
+  `LegacyOctal::{Decimal, Octal, Error}`; hex floats are correctly rounded
+  (subnormals included); non-decimal big integers are converted to exact
+  decimal digits (up to 1,024).
+- Text-keyed operator tables: `MappingBuilder::prefix_op_text`,
+  `binary_op_text`, `postfix_op_text` (a kind entry wins over a text entry).
+- `Arch::UseTree { path, alias, children }`: nested imports (`use a::{b,
+  c::{d as e}, self, *}`, PHP `use App\Models\{User, Post as P}`) flattened
+  iteratively into one HIR import per leaf.
+- `Arch::MixinRule { from, method, insteadof, alias }`: trait `insteadof`
+  exclusions and `as` aliases (new name, visibility, or both), lowered to
+  hir-lang's `MixinRule`.
+- `Arch::Attr { name, args }` and `Arch::AttrArg { key, value }`: attributes
+  attached to the HIR node of the construct they annotate (items, parameters,
+  fields, variants, statements, expressions); PHP `#[A, B]` groups splice.
+- `ProblemKind::{CannotHoist, AttributeArgument, MisplacedAttribute}`,
+  `HoistBlocker::{ByReference, ReusedHole, NoBindingSite}`,
+  `MappingError::{BadJoin, EmptyOperatorText}`.
+- Tests: `tests/semantics.rs` (10 unit tests and 5 property tests against
+  references: function-scoped bindings, interpolation, heredoc indentation,
+  integer literals, use trees); 7 new Mox tests (interpolation, heredocs,
+  function-scoped `foreach`/`catch`, trait rules, group `use`, attributes,
+  PHP number literals); the random-tree properties run under the PHP policy
+  too and check that the generator reaches the new paths. Benchmark group
+  `php`. Example `php`.
+
+### Fixed
+
+- PHP semantics in Mox lowering: `foreach` key/value and `catch` variables
+  were scoped to the loop or handler; they are now visible after it, as in
+  PHP. Integers above `i64::MAX` are floats under PHP's policy, as in PHP.
+
+### Changed
+
+- Version 0.3.0. Dependencies unchanged (`syntax-lang` 1, `hir-lang` 0.3,
+  `intern-lang` 1; `lang-forge` 1.0.1 as a dev-dependency).
+
+---
+
 ## [0.2.0] - 2026-10-08
 
 The foundation: a syntax tree, a mapping that says what its constructs mean,
@@ -99,6 +191,7 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/lower-lang/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lower-lang/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/lower-lang/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/lower-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/lower-lang/releases/tag/v0.1.0

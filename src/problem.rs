@@ -148,8 +148,58 @@ pub enum ProblemKind {
         /// The template that could not be applied.
         template: TemplateId,
     },
+    /// A binding that must be function-scoped
+    /// ([`LangPolicy::function_scoped_bindings`](crate::LangPolicy), or a
+    /// hoisted `let`) but cannot be hoisted; it stays scoped to its construct.
+    CannotHoist {
+        /// Why.
+        reason: HoistBlocker,
+    },
+    /// An attribute argument that is neither a literal nor a name (HIR
+    /// attributes are data); it is left out of the attribute.
+    AttributeArgument,
+    /// An attribute on a construct that has no HIR node to carry it (a
+    /// wrapper, a capture, a match arm); it is dropped.
+    MisplacedAttribute,
     /// A problem hir-lang's lenient validator found and repaired.
     Hir(HirError),
+}
+
+/// Why a binding could not be hoisted to its function.
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::{HoistBlocker, ProblemKind};
+///
+/// let p = ProblemKind::CannotHoist { reason: HoistBlocker::ByReference };
+/// assert_eq!(
+///     p.to_string(),
+///     "this binding cannot be function-scoped: a by-reference binding would become a copy"
+/// );
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum HoistBlocker {
+    /// A by-reference binding (`&$v`, `ref x`): hoisting assigns a copy, so
+    /// the function-scoped variable would not alias.
+    ByReference,
+    /// A template uses the pattern hole more than once, so one binding would
+    /// be assigned from several places.
+    ReusedHole,
+    /// The template never binds the pattern hole in a `match` arm or a
+    /// `let` (its expansion was cut short), so nothing assigns the binding.
+    NoBindingSite,
+}
+
+impl fmt::Display for HoistBlocker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ByReference => "a by-reference binding would become a copy",
+            Self::ReusedHole => "the template binds this pattern in more than one place",
+            Self::NoBindingSite => "the template never binds this pattern",
+        })
+    }
 }
 
 impl fmt::Display for ProblemKind {
@@ -178,6 +228,15 @@ impl fmt::Display for ProblemKind {
                 "template {} is nested too deeply to expand",
                 template.index()
             ),
+            Self::CannotHoist { reason } => {
+                write!(f, "this binding cannot be function-scoped: {reason}")
+            }
+            Self::AttributeArgument => f.write_str(
+                "an attribute argument must be a literal or a name; this one is left out",
+            ),
+            Self::MisplacedAttribute => {
+                f.write_str("nothing here can carry an attribute; it is dropped")
+            }
             Self::Hir(e) => write!(f, "{e}"),
         }
     }

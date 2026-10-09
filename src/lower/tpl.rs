@@ -18,8 +18,8 @@ use hir_lang::{
 };
 use syntax_lang::TokenKind;
 
-use super::{Frame, Run, Slot, Val};
-use crate::problem::ProblemKind;
+use super::{Frame, Persist, Run, Slot, Val};
+use crate::problem::{HoistBlocker, ProblemKind};
 use crate::template::{
     HoleKind, LabelRef, LabelSlot, NONE, TArg, TLit, TNode, Template, TemplateId,
 };
@@ -77,6 +77,11 @@ struct Holes {
     charge: u64,
     label: Option<BinderId>,
     missing_reported: bool,
+    /// Function-scoped bindings of the pattern holes, and each hole's range
+    /// in it (PHP scoping); whether each hole's were assigned already.
+    binds: Vec<Persist>,
+    ranges: Vec<(usize, usize)>,
+    injected: Vec<bool>,
 }
 
 impl<K> Run<'_, '_, K>
@@ -104,7 +109,13 @@ where
             charge: self.nodes.saturating_sub(nodes_at),
             label,
             missing_reported: false,
+            binds: Vec::new(),
+            ranges: Vec::new(),
+            injected: Vec::new(),
         };
+        if f.flag {
+            self.take_hole_binds(t.holes.len(), &mut holes);
+        }
         let expn = self.b.expansion(Expansion {
             kind: t.kind,
             name: self.sym(m.template_names.get(id.index()).copied().unwrap_or(0)),
@@ -164,8 +175,128 @@ where
         let uses = core::mem::take(&mut self.tpl_scratch.uses);
         let result = self.rescue(f, &uses, result);
         self.tpl_scratch.uses = uses;
+        // A pattern hole whose bindings no `match` arm or `let` assigned.
+        for (h, &(s, e)) in holes.ranges.iter().enumerate() {
+            if s < e && !holes.injected.get(h).copied().unwrap_or(true) {
+                let at = holes.binds.get(s).map_or(span, |p| p.span);
+                self.report(
+                    ProblemKind::CannotHoist {
+                        reason: HoistBlocker::NoBindingSite,
+                    },
+                    at,
+                );
+            }
+        }
         self.at(span);
         self.adapt_expr(result, false, f.want, span)
+    }
+
+    /// Takes this template frame's `Task::Mark`s and the function-scoped
+    /// bindings logged between them: hole `h`'s bindings are those logged
+    /// between marks `h` and `h + 1`.
+    fn take_hole_binds(&mut self, nholes: usize, holes: &mut Holes) {
+        let depth = u32::try_from(self.frames.len() + 1).unwrap_or(u32::MAX);
+        let mut marks: Vec<usize> = Vec::new();
+        while let Some(&(d, len)) = self.persist_marks.last() {
+            if d != depth {
+                break;
+            }
+            marks.push(len as usize);
+            let _ = self.persist_marks.pop();
+        }
+        marks.reverse();
+        let Some(&first) = marks.first() else {
+            return;
+        };
+        let first = first.min(self.persist.len());
+        holes.binds = self.persist.split_off(first);
+        holes.ranges = (0..nholes)
+            .map(|h| {
+                let s = marks.get(h).copied().unwrap_or(first).saturating_sub(first);
+                let e = marks
+                    .get(h + 1)
+                    .copied()
+                    .unwrap_or(s + first)
+                    .saturating_sub(first);
+                (
+                    s.min(holes.binds.len()),
+                    e.min(holes.binds.len()).max(s.min(holes.binds.len())),
+                )
+            })
+            .collect();
+        holes.injected = alloc::vec![false; nholes];
+    }
+
+    /// The node's own pattern holes that template pattern `node` (in context
+    /// `c`) contains, following `apply` arguments back to their source.
+    fn pattern_holes(&self, node: u32, c: u32, ctxs: &[Ctx], out: &mut Vec<usize>) {
+        out.clear();
+        let mut stack: Vec<(u32, u32)> = alloc::vec![(node, c)];
+        while let Some((n, c)) = stack.pop() {
+            let Some(t) = ctxs.get(c as usize).and_then(|x| self.tpl_of(x)) else {
+                continue;
+            };
+            match t.node(n).copied() {
+                Some(TNode::PHole(h)) => match self.source(usize::from(h), c, ctxs) {
+                    Source::Top(h) => out.push(h),
+                    Source::Node(pn, pc) => stack.push((pn, pc)),
+                    Source::Absent(..) => {}
+                },
+                Some(TNode::PTuple(l)) => {
+                    stack.extend(t.list(l).iter().map(|&k| (k, c)));
+                }
+                Some(TNode::PCtor { elems, .. }) => {
+                    stack.extend(t.list(elems).iter().map(|&k| (k, c)));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The bindings to assign where a template binds pattern node `pat`:
+    /// those of the pattern holes it contains (each hole once; a second
+    /// binding site is reported).
+    fn binds_at(
+        &mut self,
+        f: &Frame<K>,
+        pat: u32,
+        c: u32,
+        ctxs: &[Ctx],
+        holes: &mut Holes,
+    ) -> Vec<Persist> {
+        let mut out = Vec::new();
+        if holes.binds.is_empty() {
+            return out;
+        }
+        let mut hs = Vec::new();
+        self.pattern_holes(pat, c, ctxs, &mut hs);
+        hs.sort_unstable();
+        hs.dedup();
+        for h in hs {
+            let Some(&(s, e)) = holes.ranges.get(h) else {
+                continue;
+            };
+            if s >= e {
+                continue;
+            }
+            match holes.injected.get_mut(h) {
+                Some(done) if *done => {
+                    let at = holes.binds.get(s).map_or(f.span, |p| p.span);
+                    self.report(
+                        ProblemKind::CannotHoist {
+                            reason: HoistBlocker::ReusedHole,
+                        },
+                        at,
+                    );
+                }
+                Some(done) => {
+                    *done = true;
+                    out.extend_from_slice(holes.binds.get(s..e).unwrap_or(&[]));
+                }
+                None => {}
+            }
+        }
+        out
     }
 
     /// Sets the builder's origin to the call site inside expansion `expn`.
@@ -833,6 +964,7 @@ where
                 let scrutinee = self.t_expr(f, s, holes);
                 let mut list = Vec::new();
                 for arm in t.list(arms).chunks(3) {
+                    let pat_node = arm.first().copied().unwrap_or(NONE);
                     let guard = arm.get(1).copied().unwrap_or(NONE);
                     let p = next();
                     let pat = self.t_pat(f, ctx.expn, p);
@@ -844,6 +976,15 @@ where
                     };
                     let b = next();
                     let body = self.t_expr(f, b, holes);
+                    // PHP scoping: assign the pattern's bindings on entry.
+                    let binds = self.binds_at(f, pat_node, c, ctxs, holes);
+                    let body = if binds.is_empty() {
+                        body
+                    } else {
+                        let b = self.with_assigns(&binds, body, f.span);
+                        self.t_at(f, ctx.expn);
+                        b
+                    };
                     list.push(Arm { pat, guard, body });
                 }
                 self.t_at(f, ctx.expn);
@@ -958,7 +1099,11 @@ where
                     defaults: DefaultEval::PerCall,
                 })))
             }
-            TNode::Let { ty, init, .. } => {
+            TNode::Let {
+                pat: pat_node,
+                ty,
+                init,
+            } => {
                 let p = next();
                 let pat = self.t_pat(f, ctx.expn, p);
                 let ty = if ty == NONE {
@@ -974,12 +1119,29 @@ where
                     self.t_opt_expr(v)
                 };
                 self.t_at(f, ctx.expn);
-                Val::Stmt(self.st(Stmt::Let {
+                let stmt = self.st(Stmt::Let {
                     pat,
                     ty,
                     init,
                     else_: None,
-                }))
+                });
+                let binds = self.binds_at(f, pat_node, c, ctxs, holes);
+                if binds.is_empty() {
+                    Val::Stmt(stmt)
+                } else {
+                    let mut stmts = alloc::vec![stmt];
+                    self.persist_assigns(&binds, &mut stmts);
+                    self.t_at(f, ctx.expn);
+                    let slots: Vec<Slot> = stmts
+                        .into_iter()
+                        .map(|s| Slot {
+                            v: Val::Stmt(s),
+                            span: f.span,
+                            place: false,
+                        })
+                        .collect();
+                    self.spill_of(&slots)
+                }
             }
             TNode::ExprStmt(_) | TNode::Defer(_) => {
                 let x = next();

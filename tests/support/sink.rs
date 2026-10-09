@@ -11,14 +11,14 @@
 
 use hir_lang::{BorrowKind, CaptureMode, OpKind, PathRoot, Prim};
 use lower_lang::{
-    Arch, Escapes, LangPolicy, Mapping, MappingBuilder, Modifier, OpSpec, Pick, RecordShape, TArg,
-    TemplateBuilder, TokenRole, TypeName, templates,
+    Arch, Escapes, Join, LangPolicy, Mapping, MappingBuilder, Modifier, OpSpec, Pick, RecordShape,
+    TArg, TemplateBuilder, TokenRole, TypeName, templates,
 };
 
 use super::writer::K;
 
-pub const TOKEN_KINDS: std::ops::RangeInclusive<u16> = 1..=45;
-pub const NODE_KINDS: std::ops::RangeInclusive<u16> = 100..=200;
+pub const TOKEN_KINDS: std::ops::RangeInclusive<u16> = 1..=49;
+pub const NODE_KINDS: std::ops::RangeInclusive<u16> = 100..=208;
 pub const ERROR_KIND: K = K(197);
 pub const ROOT: K = K(100);
 
@@ -62,6 +62,21 @@ pub const TEXTS: &[&str] = &[
     "...",
     "mut",
     "pub",
+    "-",
+    "%",
+    "r#\"raw \"x\"\"#",
+    "r\"open",
+    "<<<EOT\n  a\\n\n   b\n  EOT",
+    "<<<'N'\nx $y\nN",
+    "<<<EOT\nbad\n EOT",
+    "Hello {",
+    "1_000",
+    "1__0",
+    "0777",
+    "08",
+    "0x1.8p3",
+    "0xFFFFFFFFFFFFFFFFFF",
+    "9223372036854775808",
 ];
 
 fn k(i: u16) -> K {
@@ -93,7 +108,11 @@ pub fn sink(policy: LangPolicy) -> Mapping<K> {
         .token(k(17), TokenRole::Type(TypeName::Prim(Prim::I32)))
         .token(k(18), TokenRole::Type(TypeName::Any))
         .token(k(19), TokenRole::Type(TypeName::SelfTy))
-        .token(k(20), TokenRole::Name);
+        .token(k(20), TokenRole::Name)
+        .token(k(46), TokenRole::StrPart(Escapes::Standard))
+        .token(k(47), TokenRole::RawStr)
+        .token(k(48), TokenRole::Heredoc(Escapes::Standard))
+        .token(k(49), TokenRole::Heredoc(Escapes::None));
     b.modifier(k(21), Modifier::Mut)
         .modifier(k(22), Modifier::Ref)
         .modifier(k(23), Modifier::Public)
@@ -162,7 +181,19 @@ pub fn sink(policy: LangPolicy) -> Mapping<K> {
         .prefix_op(k(42), OpSpec::Op(OpKind::Neg))
         .postfix_op(k(43), OpSpec::Template(tq))
         .postfix_op(k(44), OpSpec::Template(pi))
-        .postfix_op(k(45), OpSpec::Await);
+        .postfix_op(k(45), OpSpec::Await)
+        // Text-keyed: any token spelling `-` or `%` in operator position.
+        .binary_op_text("-", OpSpec::Op(OpKind::Sub))
+        .binary_op_text("%", OpSpec::Op(OpKind::Rem))
+        .prefix_op_text("-", OpSpec::Op(OpKind::Neg));
+    let interp_all = {
+        let mut t = TemplateBuilder::new("interp");
+        let parts = t.args_hole("parts");
+        let f = t.extern_("interp");
+        let s = t.splice(parts);
+        let root = t.call(f, &[s]);
+        b.template(t.finish(root).unwrap()).unwrap()
+    };
 
     let n = Pick::Nth;
     let all = Pick::All;
@@ -460,7 +491,10 @@ pub fn sink(policy: LangPolicy) -> Mapping<K> {
             bounds: rest,
             default: a,
         }, // 185
-        Arch::MixinUse { mixins: all }, // 186
+        Arch::MixinUse {
+            mixins: Pick::AllKind(k(1)),
+            rules: Pick::AllKind(k(205)),
+        }, // 186
         Arch::AssocBinding {
             name: n(0),
             ty: n(1),
@@ -479,6 +513,71 @@ pub fn sink(policy: LangPolicy) -> Mapping<K> {
     for (i, arch) in rules.into_iter().enumerate() {
         b.node(k(100 + i as u16), arch);
     }
+    // 0.3 archetypes: interpolation (three joins), use trees, mixin rules,
+    // attributes.
+    b.node(
+        k(201),
+        Arch::Interp {
+            parts: all,
+            close: a,
+            join: Join::Fold(echo),
+        },
+    );
+    b.node(
+        k(202),
+        Arch::Interp {
+            parts: Pick::Range(0, 1),
+            close: back,
+            join: Join::Call(echo),
+        },
+    );
+    b.node(
+        k(203),
+        Arch::Interp {
+            parts: all,
+            close: a,
+            join: Join::Template(interp_all),
+        },
+    );
+    b.node(
+        k(204),
+        Arch::UseTree {
+            path: n(0),
+            alias: Pick::After(k(36)),
+            children: Pick::Range(1, 0),
+        },
+    );
+    b.node(
+        k(205),
+        Arch::MixinRule {
+            from: Pick::Before(k(34)),
+            method: Pick::Kind(k(1)),
+            insteadof: Pick::AllAfter(k(37)),
+            alias: Pick::After(k(36)),
+        },
+    );
+    b.node(
+        k(206),
+        Arch::Attr {
+            name: n(0),
+            args: rest,
+        },
+    );
+    b.node(
+        k(207),
+        Arch::AttrArg {
+            key: n(0),
+            value: n(1),
+        },
+    );
+    b.node(
+        k(208),
+        Arch::Interp {
+            parts: all,
+            close: a,
+            join: Join::Template(and),
+        },
+    );
     b.template_node(k(191), w, &[n(0), back, Pick::Kind(k(16))]);
     b.template_node(k(192), fe, &[n(0), Pick::Before(k(37)), n(1), back, a]);
     b.template_node(k(193), cf, &[Pick::Kind(k(109)), n(1), n(2), back, a]);
@@ -502,5 +601,7 @@ pub fn policies() -> Vec<LangPolicy> {
     dynamic.implicit_locals = true;
     dynamic.place_args = lower_lang::PlaceArgs::Places;
     dynamic.ident_patterns = lower_lang::IdentPatterns::Bind;
-    vec![LangPolicy::default(), dynamic]
+    // PHP: function-scoped foreach/catch bindings, PHP number spelling.
+    let php = LangPolicy::php();
+    vec![LangPolicy::default(), dynamic, php]
 }

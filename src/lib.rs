@@ -95,11 +95,12 @@ pub use arch::{Arch, RecordShape, TemplateUse};
 pub use hir_lang::Span;
 pub use lower::{Budget, Lowered, Lowerer};
 pub use mapping::{
-    EffectMode, Escapes, Fixity, IdentPatterns, LangPolicy, Mapping, MappingBuilder, MappingError,
-    Modifier, NameRef, OpSpec, PlaceArgs, TokenRole, TypeName,
+    EffectMode, Escapes, Fixity, IdentPatterns, Join, LangPolicy, LegacyOctal, Literals, Mapping,
+    MappingBuilder, MappingError, Modifier, NameRef, OpSpec, PlaceArgs, Separators, TokenRole,
+    TypeName,
 };
 pub use pick::{Labeler, Pick};
-pub use problem::{Context, LowerError, Problem, ProblemKind};
+pub use problem::{Context, HoistBlocker, LowerError, Problem, ProblemKind};
 pub use template::{
     ArgsHole, ExprHole, HoleKind, LabelHole, LabelRef, MAX_TEMPLATE_SIZE, PatHole, StmtsHole, TArg,
     TBinder, TExpr, TLabel, TLit, TPat, TStmt, TTy, Template, TemplateBuilder, TemplateError,

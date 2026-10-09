@@ -14,10 +14,11 @@ use hir_lang::{
 use intern_lang::Symbol;
 use syntax_lang::TokenKind;
 
-use super::{Build, Frame, Run, Slot, Val, Want};
+use super::{Build, Frame, Piece, Run, Slot, Val, Want};
 use crate::arch::{Arch, RecordShape};
-use crate::mapping::{Modifier, OpSpec};
+use crate::mapping::{Join, Modifier, OpSpec};
 use crate::problem::ProblemKind;
+use crate::template::{HoleKind, TemplateId};
 
 const fn has(mods: u32, m: Modifier) -> bool {
     mods & m.bit() != 0
@@ -45,7 +46,7 @@ where
             return;
         };
         self.at(f.span);
-        let (v, place) = match f.build {
+        let (mut v, place) = match f.build {
             Build::Arch => self.finish_arch(&f),
             Build::Op(spec) => self.finish_op(&f, spec),
             Build::Template {
@@ -58,6 +59,9 @@ where
                 (self.finish_hoisted(&f, name, name_span), false)
             }
         };
+        if f.attrs.1 > 0 {
+            self.attach_attrs(&mut v, f.attrs, f.span);
+        }
         if f.or {
             self.or_depth = self.or_depth.saturating_sub(1);
         }
@@ -378,7 +382,7 @@ where
         for (j, s) in vals.iter().enumerate() {
             match s.v {
                 Val::Marker(ParamKind::NamedOnly) => named = true,
-                Val::Param(mut p, span) => {
+                Val::Param(mut p, span, attrs) => {
                     if p.kind == ParamKind::Normal {
                         if named {
                             p.kind = ParamKind::NamedOnly;
@@ -388,7 +392,17 @@ where
                     }
                     self.at(span);
                     self.nodes += 1;
-                    out.push(self.b.param(p));
+                    let id = self.b.param(p);
+                    if attrs.1 > 0 {
+                        let (a, l) = (attrs.0 as usize, attrs.1 as usize);
+                        let list: Vec<hir_lang::Attr> = self
+                            .attr_pool
+                            .get(a..a.saturating_add(l))
+                            .unwrap_or(&[])
+                            .to_vec();
+                        self.b.attach(hir_lang::NodeRef::Param(id), &list);
+                    }
+                    out.push(id);
                 }
                 _ => {}
             }
@@ -433,7 +447,7 @@ where
     pub(crate) fn adapt_pat(&mut self, p: PatId, want: Want, span: Span) -> Val {
         match want {
             Want::Pat(_) => Val::Pat(p),
-            Want::Param => Val::Param(Param::new(p), span),
+            Want::Param => Val::Param(Param::new(p), span, (0, 0)),
             _ => {
                 self.report(
                     ProblemKind::NotAllowedHere {
@@ -490,12 +504,31 @@ where
                 let init = self.opt_e(f, 2);
                 let else_ = self.opt_e(f, 3);
                 self.at(span);
-                Val::Stmt(self.st(Stmt::Let {
+                let stmt = self.st(Stmt::Let {
                     pat,
                     ty,
                     init,
                     else_,
-                }))
+                });
+                if f.aux.1 == 1 {
+                    // A hoisted `let` of a destructuring pattern: the pattern
+                    // bound temporaries; assign them to the hoisted names.
+                    let mark = (f.aux.0 as usize).min(self.persist.len());
+                    let binds = self.persist.split_off(mark);
+                    let mut stmts = alloc::vec![stmt];
+                    self.persist_assigns(&binds, &mut stmts);
+                    let slots: Vec<Slot> = stmts
+                        .into_iter()
+                        .map(|s| Slot {
+                            v: Val::Stmt(s),
+                            span,
+                            place: false,
+                        })
+                        .collect();
+                    self.spill_of(&slots)
+                } else {
+                    Val::Stmt(stmt)
+                }
             }
             Arch::ExprStmt { .. } => {
                 let e = self.req_e(f, 0, "expr");
@@ -649,13 +682,52 @@ where
             }
             Arch::MixinUse { .. } => {
                 let mixins = self.tys(f, 0);
+                let vals = self.many(f, 1);
+                let rules: Vec<hir_lang::MixinRule> = vals
+                    .iter()
+                    .filter_map(|s| match s.v {
+                        Val::Rule(r) => Some(r),
+                        _ => None,
+                    })
+                    .collect();
+                self.give(vals);
+                let rules = self.list(&rules);
                 self.at(span);
-                let def = MixinUseDef {
-                    mixins,
-                    rules: List::EMPTY,
-                };
+                let def = MixinUseDef { mixins, rules };
                 Val::Item(self.it(Item::new(None, ItemKind::MixinUse(def))))
             }
+            Arch::MixinRule { .. } => {
+                let from = self.opt_t(f, 0);
+                let others = self.tys(f, 1);
+                let (msym, mspan) = f.name.unwrap_or((self.empty, span));
+                let method = Ident::new(msym, mspan);
+                let vis_given = has(f.mods, Modifier::Public)
+                    || has(f.mods, Modifier::Protected)
+                    || has(f.mods, Modifier::Private)
+                    || has(f.mods, Modifier::Package);
+                let action = if !others.is_empty() {
+                    Some(hir_lang::MixinAction::Insteadof(others))
+                } else if f.alias.is_some() || vis_given {
+                    Some(hir_lang::MixinAction::Alias {
+                        name: f.alias.map(|(s, sp)| Ident::new(s, sp)),
+                        vis: vis_given.then(|| vis_of(f.mods)),
+                    })
+                } else {
+                    None
+                };
+                match action {
+                    Some(action) => Val::Rule(hir_lang::MixinRule {
+                        method,
+                        from,
+                        action,
+                    }),
+                    None => {
+                        self.report(ProblemKind::MissingField { field: "action" }, span);
+                        Val::Err
+                    }
+                }
+            }
+            Arch::Interp { join, .. } => return self.finish_interp(f, join),
             Arch::FieldDecl { .. } => {
                 let ty = self.opt_t(f, 0);
                 let default = self.opt_e(f, 1);
@@ -768,6 +840,7 @@ where
                         by_ref: has(f.mods, Modifier::Ref),
                     },
                     span,
+                    (0, 0),
                 )
             }
             Arch::Path { .. } => return self.finish_path(f),
@@ -1376,9 +1449,158 @@ where
             | Arch::Binary { .. }
             | Arch::Postfix { .. }
             | Arch::Assign { .. }
-            | Arch::RefAssign { .. } => self.error_val(want, span),
+            | Arch::RefAssign { .. }
+            | Arch::UseTree { .. }
+            | Arch::Attr { .. }
+            | Arch::AttrArg { .. } => self.error_val(want, span),
         };
         (v, false)
+    }
+
+    /// An interpolated string: its pieces joined per `join`.
+    fn finish_interp(&mut self, f: &Frame<K>, join: Join) -> (Val, bool) {
+        let span = f.span;
+        let (base, len) = (f.aux.0 as usize, f.aux.1 as usize);
+        let pieces: Vec<Piece> = self
+            .pieces
+            .get(base..base.saturating_add(len))
+            .unwrap_or(&[])
+            .to_vec();
+        self.pieces.truncate(base);
+        let (s, _) = self.field_range(f, 0);
+        let mut parts: Vec<ExprId> = Vec::with_capacity(pieces.len());
+        let mut k = 0usize;
+        let mut exprs = 0usize;
+        for piece in pieces {
+            match piece {
+                Piece::Text(t, sp) => {
+                    self.at(sp);
+                    parts.push(self.ex(Expr::Lit(hir_lang::Lit::Str(t))));
+                }
+                Piece::Expr => {
+                    let e = match self.vals.get(s + k).map(|x| x.v) {
+                        Some(Val::Expr(e)) => e,
+                        _ => self.err_expr(span),
+                    };
+                    k += 1;
+                    exprs += 1;
+                    parts.push(e);
+                }
+            }
+        }
+        let result = match parts.as_slice() {
+            [] => self.empty_str(span),
+            [one] if exprs == 0 => *one,
+            _ => {
+                // A lone expression is joined with "" first: a conversion.
+                if parts.len() == 1 {
+                    let empty = self.empty_str(span);
+                    parts.insert(0, empty);
+                }
+                self.join_parts(join, &parts, span)
+            }
+        };
+        let v = self.adapt_expr(result, false, f.want, span);
+        (v, false)
+    }
+
+    fn empty_str(&mut self, span: Span) -> ExprId {
+        self.at(span);
+        let t = self.b.text("");
+        self.ex(Expr::Lit(hir_lang::Lit::Str(t)))
+    }
+
+    /// A call of host function `name` (`Res::Extern`) with `args`.
+    fn extern_call(
+        &mut self,
+        name: crate::mapping::NameRef,
+        args: &[ExprId],
+        span: Span,
+    ) -> ExprId {
+        let sym = self.sym(name.0);
+        self.at(span);
+        let seg = Segment::new(Name::new(sym), Origin::new(span));
+        let segs = self.list(&[seg]);
+        let mut p = Path::new(segs, Ns::Value);
+        p.res = Res::Extern(sym);
+        let path = self.path(p);
+        let callee = self.ex(Expr::Path(path));
+        let args: Vec<Arg> = args.iter().map(|&e| Arg::positional(e)).collect();
+        let args = self.list(&args);
+        self.ex(Expr::Call { callee, args })
+    }
+
+    /// Joins at least two parts.
+    fn join_parts(&mut self, join: Join, parts: &[ExprId], span: Span) -> ExprId {
+        match join {
+            Join::Call(name) => self.extern_call(name, parts, span),
+            Join::Fold(name) => {
+                let mut acc = parts
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| self.err_expr(span));
+                for &p in parts.get(1..).unwrap_or(&[]) {
+                    acc = self.extern_call(name, &[acc, p], span);
+                }
+                acc
+            }
+            Join::Template(id) => {
+                let args_hole = self.m.templates.get(id.index()).is_some_and(|t| {
+                    t.holes.len() == 1 && t.holes.iter().all(|h| h.kind == HoleKind::Args)
+                });
+                if args_hole {
+                    let vals: Vec<Val> = parts
+                        .iter()
+                        .map(|&e| Val::Arg(Arg::positional(e)))
+                        .collect();
+                    self.instantiate(id, span, &[&vals])
+                } else {
+                    let mut acc = parts
+                        .first()
+                        .copied()
+                        .unwrap_or_else(|| self.err_expr(span));
+                    for &p in parts.get(1..).unwrap_or(&[]) {
+                        acc = self.instantiate(id, span, &[&[Val::Expr(acc)], &[Val::Expr(p)]]);
+                    }
+                    acc
+                }
+            }
+        }
+    }
+
+    /// Instantiates template `id` with already-lowered hole values (one
+    /// slice per hole), through a synthetic frame.
+    pub(crate) fn instantiate(&mut self, id: TemplateId, span: Span, holes: &[&[Val]]) -> ExprId {
+        let vals_base = self.vals.len();
+        let counts_base = self.counts.len();
+        for h in holes {
+            for &v in *h {
+                self.vals.push(Slot {
+                    v,
+                    span,
+                    place: false,
+                });
+            }
+            self.counts.push(h.len());
+        }
+        let mut fr = self.frame(Arch::Unsupported, Want::Expr, span);
+        fr.build = Build::Template {
+            id,
+            label: None,
+            nodes_at: self.nodes,
+        };
+        fr.counts_base = counts_base;
+        fr.nfields = holes.len();
+        fr.vals_base = vals_base;
+        fr.spill_base = self.spill.len();
+        let nodes = self.nodes;
+        let v = self.finish_template(&fr, id, None, nodes);
+        self.vals.truncate(vals_base);
+        self.counts.truncate(counts_base);
+        match v {
+            Val::Expr(e) => e,
+            _ => self.err_expr(span),
+        }
     }
 
     /// A slice pattern from a list with an optional `..`.
@@ -1551,10 +1773,23 @@ where
             .collect();
         self.give(vals);
         let body = self.req_e(f, 1, "body");
+        // PHP scoping: the caught exception's variable belongs to the
+        // function; the arm binds a temporary and assigns it on entry.
+        let persist = self.m.policy.function_scoped_bindings;
+        let mut binds: Vec<super::Persist> = Vec::new();
         let binder = f.name.map(|(sym, nspan)| {
-            self.at(nspan);
-            self.binder(Name::new(sym), BinderKind::Local, false)
+            if persist {
+                let b = self.persist_binder(sym, nspan);
+                if let Some(p) = self.persist.pop() {
+                    binds.push(p);
+                }
+                b
+            } else {
+                self.at(nspan);
+                self.binder(Name::new(sym), BinderKind::Local, false)
+            }
         });
+        let body = self.with_assigns(&binds, body, span);
         self.at(span);
         let bind = |this: &mut Self| {
             binder.map(|b| {
@@ -1650,7 +1885,7 @@ where
                         Want::Param => {
                             let site = super::enter::site_of(want).unwrap_or(super::PatSite::LOCAL);
                             let p = self.ident_pat(sym, nspan, site);
-                            return (Val::Param(Param::new(p), span), false);
+                            return (Val::Param(Param::new(p), span, (0, 0)), false);
                         }
                         Want::Ty | Want::GArg => {
                             let m = self.m;

@@ -1,7 +1,7 @@
 # lower-lang &mdash; API Reference
 
 > Complete reference for every public item in `lower-lang`, with examples.
-> **Status: pre-1.0 (0.2.0, Foundation).** The surface is designed across the
+> **Status: pre-1.0 (0.3.0, PHP and Python semantics).** The surface is designed across the
 > 0.x series and frozen at 1.0, after the LexerSketch app has lowered at least
 > three target languages through it (decision D18). See
 > [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
@@ -20,6 +20,11 @@
   - [Templates and hygiene](#templates-and-hygiene)
   - [Origins](#origins)
   - [Effects and hoisting](#effects-and-hoisting)
+  - [Function-scoped bindings (PHP)](#function-scoped-bindings-php)
+  - [Interpolated strings and heredocs](#interpolated-strings-and-heredocs)
+  - [Number literals](#number-literals)
+  - [Operators by kind or by text](#operators-by-kind-or-by-text)
+  - [Use trees, mixin rules, attributes](#use-trees-mixin-rules-attributes)
   - [Problems and half-typed code](#problems-and-half-typed-code)
 - [`lower`](#lower)
 - [`Lowerer`](#lowerer)
@@ -35,13 +40,14 @@
 - [`TokenRole`](#tokenrole), [`Escapes`](#escapes), [`TypeName`](#typename)
 - [`Modifier`](#modifier)
 - [`LangPolicy`](#langpolicy), [`EffectMode`](#effectmode), [`IdentPatterns`](#identpatterns), [`PlaceArgs`](#placeargs)
-- [`OpSpec`](#opspec), [`Fixity`](#fixity), [`NameRef`](#nameref)
+- [`Literals`](#literals), [`Separators`](#separators), [`LegacyOctal`](#legacyoctal)
+- [`OpSpec`](#opspec), [`Fixity`](#fixity), [`NameRef`](#nameref), [`Join`](#join)
 - [`Template`](#template)
 - [`TemplateBuilder`](#templatebuilder)
 - [Template handles](#template-handles)
 - [`TemplateId`](#templateid), [`HoleKind`](#holekind), [`TLit`](#tlit), [`LabelRef`](#labelref), [`TArg`](#targ)
 - [`templates`](#templates)
-- [`Problem`](#problem), [`ProblemKind`](#problemkind), [`Context`](#context)
+- [`Problem`](#problem), [`ProblemKind`](#problemkind), [`HoistBlocker`](#hoistblocker), [`Context`](#context)
 - [Errors](#errors): [`LowerError`](#lowererror), [`MappingError`](#mappingerror), [`TemplateError`](#templateerror)
 - [Re-exports](#re-exports)
 - [Feature flags](#feature-flags)
@@ -60,18 +66,20 @@
 | [`Arch`](#arch) | enum | The archetype catalogue. |
 | [`Pick`](#pick), [`Labeler`](#labeler) | enum, trait | Where a field is among a node's children. |
 | [`TokenRole`](#tokenrole), [`Modifier`](#modifier), [`TypeName`](#typename), [`Escapes`](#escapes) | enums | What tokens mean. |
-| [`LangPolicy`](#langpolicy) and its enums | struct | Language-wide policies (overflow, effects, implicit locals, ...). |
+| [`LangPolicy`](#langpolicy) and its enums | struct | Language-wide policies (overflow, effects, implicit locals, PHP scoping, ...); `LangPolicy::php()` is the PHP/Mox preset. |
+| [`Literals`](#literals), [`Separators`](#separators), [`LegacyOctal`](#legacyoctal) | struct, enums | How number literals are spelled. |
 | [`OpSpec`](#opspec) | enum | What an operator token lowers to. |
+| [`Join`](#join) | enum | How the pieces of an interpolated string become one string. |
 | [`Template`](#template), [`TemplateBuilder`](#templatebuilder), handles | types | Hygienic lowering templates. |
 | [`templates`](#templates) | module | Ready-made templates for common sugar. |
-| [`Problem`](#problem), [`ProblemKind`](#problemkind), [`Context`](#context) | types | What is wrong with the code, and where. |
+| [`Problem`](#problem), [`ProblemKind`](#problemkind), [`HoistBlocker`](#hoistblocker), [`Context`](#context) | types | What is wrong with the code, and where. |
 | [`LowerError`](#lowererror), [`MappingError`](#mappingerror), [`TemplateError`](#templateerror) | enums | Exhausted resources; refused mappings and templates. |
 
 ## Installation
 
 ```toml
 [dependencies]
-lower-lang = "0.2"
+lower-lang = "0.3"
 hir-lang = "0.3"
 intern-lang = "1"
 syntax-lang = "1"
@@ -81,7 +89,7 @@ Without the standard library:
 
 ```toml
 [dependencies]
-lower-lang = { version = "0.2", default-features = false }
+lower-lang = { version = "0.3", default-features = false }
 ```
 
 ## Quick start
@@ -203,7 +211,86 @@ PHP) or every frame (`Always`: any PHP function may throw). A hoisted `Let`
 (JavaScript `var`) and, with `implicit_locals`, a plain variable assignment
 (PHP) declare the name once at the top of the enclosing function or module
 body (names a parameter, `global`, `static`, or capture already declares are
-left alone).
+left alone). A hoisted `Let` with a destructuring pattern (`var [a, b] = x`)
+binds hygienic temporaries and assigns them to the hoisted names right after
+the pattern matches.
+
+### Function-scoped bindings (PHP)
+
+In PHP the variables a `foreach` binds and the variable a `catch` binds belong
+to the enclosing function: they keep their last value after the loop or
+handler. With [`LangPolicy::function_scoped_bindings`](#langpolicy) (on in
+`LangPolicy::php()`), every pattern hole of a template (the `key` and `value`
+of `for_each`) and every `Catch` name is lowered the same way as a hoisted
+`Let`: the names are declared once at the top of the function (or module
+body), the pattern itself binds hygienic temporaries (each marked with its own
+`Desugar` expansion named `hoist`), and an assignment from each temporary to
+its function-scoped name runs right after the pattern matches. Any pattern
+shape works (`foreach ($m as [$a, [$b, $c]])`). What cannot be hoisted this
+way stays scoped to its construct and is reported as
+[`CannotHoist`](#problemkind) with a [`HoistBlocker`](#hoistblocker): a
+by-reference binding (`foreach ($a as &$v)`: an assignment would copy, not
+alias), a hole the template binds in more than one place, or a hole whose
+binding site was cut away (a depth-budget cut).
+
+### Interpolated strings and heredocs
+
+A lexer delivers `"Hello {$name}!"` in segments. The string's node is an
+[`Arch::Interp`](#arch): its text pieces are tokens with role
+[`TokenRole::StrPart`](#tokenrole) (escapes decoded, adjacent pieces merged)
+and every other selected child is an embedded expression (`$name` as a
+variable token, `{$a['k']}` as an index node; braces and quotes are skip kinds
+or left out by the `parts` pick). The pieces become one string through the
+rule's [`Join`](#join): a left fold of a two-argument host function (PHP's
+`.`), one call with every piece, or a template. One text piece alone is a
+string literal; a lone expression is joined with the empty string, so the
+result is always a string conversion.
+
+A heredoc is the same node with a `close` pick naming its closing marker: the
+marker's indentation is removed from every line of the text pieces (PHP
+7.3+), a line indented less (or starting with an embedded expression) is an
+[`InvalidLiteral`](#problemkind), and the
+newline before the marker is dropped. A heredoc or nowdoc without
+interpolation can also be one token ([`TokenRole::Heredoc`](#tokenrole)).
+
+The expected CST shapes for Mox are documented in `tests/support/mox.rs`
+(`DqString`, `HeredocStr`).
+
+### Number literals
+
+[`LangPolicy::literals`](#literals) is the decoding table: digit separators
+(anywhere, only between digits as in PHP 7.4+, or never), what a leading `0`
+means (decimal, octal as in PHP and C, or an error as in Python 3), and
+whether hexadecimal floats (`0x1.8p3`) are accepted. Integers too large for
+64 bits follow [`LangPolicy::overflow`](#langpolicy): with `Promote` (PHP) a
+value above `i64::MAX` is the nearest `f64`; otherwise a decimal value is an
+exact big integer and a binary, octal, or hex one is converted to its exact
+decimal digits (up to 1,024). Raw strings ([`TokenRole::RawStr`](#tokenrole):
+Rust `r#"…"#`, Python `r'…'`) are taken verbatim.
+
+### Operators by kind or by text
+
+Operator tables are keyed by token kind (`binary_op(kind, spec)`) or, for
+lexers that give every operator one kind, by the token's text
+(`binary_op_text("+=", spec)`). The kind entry wins when both match.
+
+### Use trees, mixin rules, attributes
+
+- [`Arch::UseTree`](#arch) flattens nested imports (`use a::{b, c::{d as e},
+  self, *}`, PHP `use App\Models\{User, Post as P}`) into one HIR import per
+  leaf, iteratively; `self` imports the prefix, an empty group imports nothing.
+- [`Arch::MixinUse`](#arch) takes conflict-resolution `rules`; each
+  [`Arch::MixinRule`](#arch) is `T::m insteadof U` (an exclusion) or
+  `T::m as protected n` (an alias with a new name, a visibility, or both),
+  lowered to hir-lang's `MixinRule`.
+- [`Arch::Attr`](#arch) nodes (`#[Route("/x", methods: GET)]`) are attached to
+  the HIR node of the construct they are a direct child of, as hir-lang
+  attributes. Attribute nodes, and container nodes holding only attributes
+  (PHP's `#[A, B]` group), are invisible to every other pick. Arguments must be
+  literals or names (HIR attributes are data); anything else is an
+  [`AttributeArgument`](#problemkind) problem, and an attribute on something
+  with no HIR node to carry it (a wrapper, a capture, a match arm) is a
+  [`MisplacedAttribute`](#problemkind) problem.
 
 ### Problems and half-typed code
 
@@ -392,6 +479,7 @@ Every method records and returns `&mut Self` (chainable); `build` checks.
 | `type_name(text, name)` | an identifier spelled `text` is a [`TypeName`](#typename) |
 | `suffix(text, prim)` | numbers ending in `text` have type `prim` |
 | `prefix_op(kind, spec)`, `binary_op(kind, spec)`, `postfix_op(kind, spec)` | operator tokens and their [`OpSpec`](#opspec) |
+| `prefix_op_text(text, spec)`, `binary_op_text(text, spec)`, `postfix_op_text(text, spec)` | operators found by the token's text (`"+="`), for lexers that give operators one kind; a kind entry wins over a text entry |
 | `name(text) -> NameRef` | stores a host or intrinsic name for `OpSpec::Extern` / `Intrinsic` |
 | `policy(policy)` | the [`LangPolicy`](#langpolicy) |
 | `template(t) -> Result<TemplateId, MappingError>` | registers a [`Template`](#template); its `apply`s must name templates registered before it, with matching arguments |
@@ -400,9 +488,10 @@ Every method records and returns `&mut Self` (chainable); `build` checks.
 
 **Errors (`build`):** a required field without a pick, a kind with two
 entries in a one-entry table (roles, modifiers, roots, each operator
-position), a duplicate type name, an unknown template or a wrong number of
-template picks, or an operator spec that cannot apply at its position. See
-[`MappingError`](#mappingerror).
+position, each operator text), a duplicate type name, an unknown template or
+a wrong number of template picks, an operator spec that cannot apply at its
+position, an empty operator text, or an interpolation [`Join`](#join)
+template of the wrong shape. See [`MappingError`](#mappingerror).
 
 ```rust
 use hir_lang::OpKind;
@@ -458,12 +547,13 @@ leaves one `Absent` is refused). *List* fields take every match. The
 
 | Variant | Fields | Lowers to | Modifiers |
 |---|---|---|---|
-| `Let` | `pat` (req), `ty`, `init`, `else_`, `mutable: bool`, `hoist: bool` | `Stmt::Let`; hoisted: a function-level `let` plus an assignment | `Mut` |
+| `Let` | `pat` (req), `ty`, `init`, `else_`, `mutable: bool`, `hoist: bool` | `Stmt::Let`; hoisted: a function-level `let` plus an assignment (a destructuring pattern binds temporaries assigned to the hoisted names) | `Mut` |
 | `ExprStmt` | `expr` (req) | `Stmt::Expr` (never a block tail) | |
 | `Defer` | `body` (req) | `Stmt::Defer` | |
 | `Static` | `name` (req), `ty`, `init` | `Stmt::Static` | |
 | `GlobalDecl` | `names` (list) | one `Stmt::Global` per name | |
 | `Import` | `path` (req), `alias` | `ItemKind::Import` | `Glob`, visibility |
+| `UseTree` | `path`, `alias`, `children` (list) | one `ItemKind::Import` per leaf of a nested tree (`use a::{b, c::{d as e}, self, *}`); prefixes concatenate, `self` imports the prefix, an empty group imports nothing | `Glob` (a `*` leaf), visibility (outermost tree) |
 
 **Declarations** (statement or member contexts)
 
@@ -479,7 +569,8 @@ leaves one `Absent` is refused). *List* fields take every match. The
 | `AssocType` | `name` (req), `bounds`, `default` | `ItemKind::AssocType` (members only) | |
 | `Const` | `name` (req), `ty`, `value` | `ItemKind::Const` | visibility |
 | `GlobalVar` | `name` (req), `ty`, `init`, `mutable: bool` | `ItemKind::Global` | visibility, `Mut` |
-| `MixinUse` | `mixins` (list) | `ItemKind::MixinUse` (members only) | |
+| `MixinUse` | `mixins` (list), `rules` (list) | `ItemKind::MixinUse` with its rules (members only) | |
+| `MixinRule` | `from`, `method` (req), `insteadof` (list), `alias` | a `MixinRule`: `T::m insteadof U` excludes; `T::m as n` / `m as protected` aliases (a rule with neither is a `MissingField` problem, field `action`) | `Public`, `Protected`, `Private` (the alias's visibility) |
 | `FieldDecl` | `name`, `ty`, `default` | a `FieldDef` (or, for a `Static` class member, `ItemKind::Global`) | visibility, `Static` |
 | `VariantDecl` | `name` (req), `fields`, `discriminant`, `shape` | a `Variant` | |
 | `GenericParam` | `name` (req), `bounds`, `ty`, `default` | a `GenericParam` (type, const, or region parameter) | |
@@ -523,6 +614,14 @@ ones before it positional-only.
 | `Await`, `Yield`, `Spawn` | | effects |
 | `Closure` | `params`, `ret`, `captures`, `body` (req), `implicit` | `Expr::Closure` (`Async`, `Generator`, `Throws` modifiers) |
 | `Template` | (a [`TemplateUse`](#templateuse)) | the template's instantiation |
+| `Interp` | `parts` (list), `close`, `join: Join` | an interpolated string or heredoc: text pieces (`StrPart` tokens) and embedded expressions joined by the [`Join`](#join); `close` picks a heredoc's closing marker (indentation stripping) |
+
+**Attributes**
+
+| Variant | Fields | Lowers to |
+|---|---|---|
+| `Attr` | `name` (req), `args` (list) | an HIR attribute (`Attr`) on the construct the node is a direct child of; the name is kept as written (`\App\Route`) |
+| `AttrArg` | `key`, `value` | a named argument (`methods: GET`), or a bare key; values must be literals or names |
 
 **Patterns**: `WildPat`, `RestPat { bind }`, `BindPat { name, sub }`
 (`Ref`, `Mut`; `x @ ..` binds a slice rest), `TuplePat`, `CtorPat`,
@@ -600,7 +699,9 @@ pub const fn is_absent(&self) -> bool          // Default: Absent
 
 Used where one child is expected, a list pick takes its first match. List
 picks splice container kinds and leave out skip kinds (except `Nodes`,
-`AllKind`, and `Label`, which keep exactly what they name).
+`AllKind`, and `Label`, which keep exactly what they name). Attribute nodes
+(kinds with an [`Attr`](#arch) rule), and container nodes holding nothing but
+attributes, are invisible to every pick: positions are counted without them.
 
 ```rust
 use lower_lang::Pick;
@@ -640,18 +741,30 @@ assert_eq!(FirstIsTarget.label(&Node::<u8>::new(1, vec![]), 0), Some(0));
 
 `#[non_exhaustive]`: `Name`, `Var { sigil }` (`$x`), `Label { sigil }`
 (`'outer`), `Lifetime { sigil }` (`'a`), `Int`, `Float`, `Number` (a float if
-it has a fraction or exponent), `Str(Escapes)`, `Char(Escapes)`,
-`Bytes(Escapes)`, `True`, `False`, `Null`, `Wild` (`_`: a wildcard pattern or
-an inferred type), `Rest` (`..` in patterns), `Type(TypeName)` (a type
-keyword). `sigil` is the number of leading bytes that are not part of the
-name. Numbers accept `0x`/`0o`/`0b` prefixes, `_` separators, and registered
-suffixes; decimal integers beyond 64 bits become big-integer literals.
+it has a fraction or exponent), `Str(Escapes)`, `RawStr`, `Heredoc(Escapes)`,
+`StrPart(Escapes)`, `Char(Escapes)`, `Bytes(Escapes)`, `True`, `False`,
+`Null`, `Wild` (`_`: a wildcard pattern or an inferred type), `Rest` (`..` in
+patterns), `Type(TypeName)` (a type keyword). `sigil` is the number of
+leading bytes that are not part of the name.
+
+| Role | Token text | Value |
+|---|---|---|
+| `Str(e)` | quotes included | the body, escapes decoded per `e` |
+| `RawStr` | optional prefix letters (`r`, `R`, `br`), optional `#` fences, one quote or a tripled one (`"""`) | the body verbatim (Rust `r#"a "b""#`, Python `r'\d+'`); malformed fences are `InvalidLiteral` |
+| `Heredoc(e)` | `<<<ID` (or `<<<"ID"`, `<<<'ID'`), a newline, the body, the closing `ID` on its own line | the body with the closing marker's indentation removed from every line (PHP 7.3+) and the final newline dropped; `Standard` for a heredoc, `None` for a nowdoc |
+| `StrPart(e)` | a piece of an [`Interp`](#arch) string, no quotes | the piece, escapes decoded |
+
+Numbers accept `0x`/`0o`/`0b` prefixes, digit separators, legacy octal, and
+hex floats as the language's [`Literals`](#literals) table allows, and
+registered suffixes; integers beyond 64 bits follow the overflow policy (see
+[Number literals](#number-literals)).
 
 ```rust
 use lower_lang::{Escapes, TokenRole};
 
 assert_ne!(TokenRole::Var { sigil: 1 }, TokenRole::Name);
 assert_eq!(TokenRole::Str(Escapes::Standard), TokenRole::Str(Escapes::Standard));
+assert_ne!(TokenRole::Heredoc(Escapes::Standard), TokenRole::Heredoc(Escapes::None));
 ```
 
 ### `Escapes`
@@ -698,7 +811,9 @@ pub struct LangPolicy {
     pub overflow: Overflow, pub div_zero: DivZero, pub shift: Shift, pub float_to_int: FloatToInt,
     pub throws: EffectMode, pub yields: EffectMode, pub asyncs: EffectMode,
     pub implicit_locals: bool, pub ident_patterns: IdentPatterns, pub place_args: PlaceArgs,
+    pub function_scoped_bindings: bool, pub literals: Literals,
 }
+pub fn php() -> Self   // the PHP / Mox preset
 ```
 
 | Field | Default | Meaning |
@@ -708,15 +823,28 @@ pub struct LangPolicy {
 | `implicit_locals` | `false` | PHP: assigning to a plain variable declares it for the enclosing body |
 | `ident_patterns` | `Ident` | bare identifiers in match arms ([`IdentPatterns`](#identpatterns)) |
 | `place_args` | `Marked` | which arguments are places ([`PlaceArgs`](#placeargs)) |
+| `function_scoped_bindings` | `false` | PHP: `for-each` pattern holes and `catch` names belong to the enclosing function ([Function-scoped bindings](#function-scoped-bindings-php)) |
+| `literals` | `Literals::default()` | how number literals are spelled ([`Literals`](#literals)) |
 
 A cast carries the language's `overflow` and `float_to_int` policies, except
 that `Promote` (valid only for dynamically typed results) becomes `Error`.
 
+`LangPolicy::php()` is the PHP and Mox preset: `overflow = Promote`, `throws =
+Always`, `yields = Inferred`, `implicit_locals`, `place_args = Places`,
+`function_scoped_bindings`, and PHP's number spelling (`_` between digits,
+`0777` octal, no hex floats); every other field is the default.
+
 ```rust
 use hir_lang::Overflow;
-let mut p = lower_lang::LangPolicy::default();
+use lower_lang::{LangPolicy, LegacyOctal};
+
+let mut p = LangPolicy::default();
 p.overflow = Overflow::Wrap;
 assert_eq!(p.overflow, Overflow::Wrap);
+
+let php = LangPolicy::php();
+assert!(php.function_scoped_bindings && php.implicit_locals);
+assert_eq!(php.literals.legacy_octal, LegacyOctal::Octal);
 ```
 
 ### `EffectMode`
@@ -740,6 +868,51 @@ use lower_lang::{EffectMode, IdentPatterns, PlaceArgs};
 assert_eq!(EffectMode::default(), EffectMode::Declared);
 assert_eq!(IdentPatterns::default(), IdentPatterns::Ident);
 assert_eq!(PlaceArgs::default(), PlaceArgs::Marked);
+```
+
+## `Literals`
+
+```rust,ignore
+#[non_exhaustive]
+pub struct Literals { pub separators: Separators, pub legacy_octal: LegacyOctal, pub hex_floats: bool }
+```
+
+The number-literal decoding table, in [`LangPolicy::literals`](#langpolicy).
+
+| Field | Default | PHP (`LangPolicy::php()`) | Meaning |
+|---|---|---|---|
+| `separators` | `Anywhere` | `BetweenDigits` | where `_` may appear ([`Separators`](#separators)) |
+| `legacy_octal` | `Decimal` | `Octal` | what `0777` means ([`LegacyOctal`](#legacyoctal)) |
+| `hex_floats` | `true` | `false` | whether `0x1.8p3` (= 12.0) is accepted; decoded with correct rounding, subnormals included |
+
+A literal the table rejects is an [`InvalidLiteral`](#problemkind) problem.
+
+```rust
+use lower_lang::{LegacyOctal, Literals, Separators};
+
+let mut php = Literals::default();
+php.separators = Separators::BetweenDigits;
+php.legacy_octal = LegacyOctal::Octal;
+php.hex_floats = false;
+assert!(Literals::default().hex_floats);
+```
+
+### `Separators`
+
+`Anywhere` (default: after the first digit, repeated and trailing allowed;
+Rust), `BetweenDigits` (only between two digits of the radix: `1_000`,
+`0xFF_FF`, not `1__0`, `10_`, `0x_FF`, `1_.5`; PHP 7.4+, JavaScript), `None`
+(C, PHP before 7.4).
+
+### `LegacyOctal`
+
+`Decimal` (default: `0777` is 777; Rust), `Octal` (`0777` is 511, `08` is
+invalid; C, PHP), `Error` (Python 3; `0`, `00`, and `0.5` stay valid).
+
+```rust
+use lower_lang::{LegacyOctal, Separators};
+assert_eq!(Separators::default(), Separators::Anywhere);
+assert_eq!(LegacyOctal::default(), LegacyOctal::Decimal);
 ```
 
 ## `OpSpec`
@@ -793,6 +966,33 @@ interned per lowering run.
 ```rust
 let mut b = lower_lang::MappingBuilder::<u8>::new();
 assert_ne!(b.name("a"), b.name("b"));
+```
+
+## `Join`
+
+```rust,ignore
+#[non_exhaustive]
+pub enum Join { Fold(NameRef), Call(NameRef), Template(TemplateId) }
+```
+
+How the pieces of an [`Arch::Interp`](#arch) string become one string.
+
+| Join | `"a{$x}b"` lowers to |
+|---|---|
+| `Fold(f)` | `f(f("a", x), "b")`: a host function of two arguments, folded left (PHP's `.`) |
+| `Call(f)` | `f("a", x, "b")`: one host call with every piece |
+| `Template(id)` | a template with two expression holes, folded left like `Fold`; or one with one argument-list hole, receiving every piece. Any other shape is refused by `build` ([`MappingError::BadJoin`](#mappingerror)) |
+
+Every instantiation of a `Template` join records its expansion like any other
+template use.
+
+```rust
+use lower_lang::{Arch, Join, MappingBuilder, Pick};
+
+let mut b = MappingBuilder::<u8>::new();
+let concat = b.name("mox.concat");
+b.node(1, Arch::Interp { parts: Pick::All, close: Pick::Absent, join: Join::Fold(concat) });
+assert!(b.build().is_ok());
 ```
 
 ## `Template`
@@ -986,7 +1186,28 @@ assert_eq!(p.to_string(), "3..9: no enclosing loop or block has this label");
 | `BadSpan` | a token span outside the source (a host bug) |
 | `MissingHole { template }` | a required template hole is absent |
 | `ExpansionTooDeep { template }` | a template application past the depth budget |
+| `CannotHoist { reason }` | a binding that should be function-scoped (a hoisted `let`, PHP `foreach`/`catch`) but cannot be; it stays scoped ([`HoistBlocker`](#hoistblocker)) |
+| `AttributeArgument` | an attribute argument that is neither a literal nor a name; it is left out |
+| `MisplacedAttribute` | an attribute on a construct with no HIR node to carry it; it is dropped |
 | `Hir(HirError)` | a problem hir-lang's lenient validator repaired |
+
+## `HoistBlocker`
+
+`#[non_exhaustive]`: why a binding could not be function-scoped.
+`ByReference` (an assignment from a temporary would copy, not alias),
+`ReusedHole` (the template binds the pattern hole in more than one place),
+`NoBindingSite` (the template's binding site was cut away, e.g. by the depth
+budget).
+
+```rust
+use lower_lang::{HoistBlocker, ProblemKind};
+
+let p = ProblemKind::CannotHoist { reason: HoistBlocker::ByReference };
+assert_eq!(
+    p.to_string(),
+    "this binding cannot be function-scoped: a by-reference binding would become a copy"
+);
+```
 
 ## `Context`
 
@@ -1023,8 +1244,10 @@ assert_eq!(
 `#[non_exhaustive]`: `MissingField { rule, field }`, `DuplicateKind { table,
 index }`, `DuplicateTypeName { index }`, `UnknownTemplate { template }`,
 `HoleCount { rule, expected, found }`, `ApplyArgs { template }`,
-`BadOperator { fixity, index }`, `TooLarge`. Indexes are registration
-positions.
+`BadOperator { fixity, index }`, `TooLarge`, `BadJoin { rule }` (an
+interpolation [`Join`](#join) template with neither two expression holes nor
+one argument-list hole), `EmptyOperatorText { fixity, index }`. Indexes are
+registration positions.
 
 ```rust
 use lower_lang::{Arch, MappingBuilder, MappingError, Pick};
@@ -1068,13 +1291,16 @@ assert_eq!(t.finish(root), Err(TemplateError::HoleUnused { hole: 0 }));
 | HIR nodes per lowering | `Budget::max_nodes` (default 2^24) | `LowerError::NodeBudget` |
 | Template application depth | `Budget::max_expansion_depth` (default 64) | `ExpansionTooDeep` problem |
 | Template size | `MAX_TEMPLATE_SIZE` = 2^20 nodes, shared sub-trees counted per use | `TemplateError::TooLarge` |
+| Exact decimal digits of a non-decimal big integer | 1,024 | `InvalidLiteral` problem |
+| Use-tree nesting, interpolation pieces | none (iterative) | — |
 | Tree depth | none (iterative) | — |
 
 ## Stability
 
 Pre-1.0. The 0.x series may break the API; each break is listed in the
 CHANGELOG. `Arch`, `Pick`, `TokenRole`, `Modifier`, `OpSpec`, `ProblemKind`,
-`Context`, the error enums, `Budget`, `Lowered`, and `LangPolicy` are
+`Context`, `HoistBlocker`, `Join`, the error enums, `Budget`, `Lowered`,
+`LangPolicy`, and `Literals` are
 `#[non_exhaustive]`, so new archetypes, picks, roles, and policies are
 additive. The exact wording of problem and error messages is not part of the
 contract; match on variants.

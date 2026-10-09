@@ -158,7 +158,7 @@ proptest! {
     /// templates stay hygienic (also after a resolver runs); and lowering is
     /// deterministic.
     #[test]
-    fn prop_random_trees_lower_soundly(t in tree_strategy(), policy in 0usize..2) {
+    fn prop_random_trees_lower_soundly(t in tree_strategy(), policy in 0usize..3) {
         let mapping = sink::sink(sink::policies()[policy]);
         let (tree, src) = write(&t);
         let mut names = Interner::new();
@@ -724,4 +724,62 @@ fn test_deep_trees_lower_without_recursion() {
         }
     });
     assert_eq!(negs, depth);
+}
+
+/// Guards the generator: random trees under the PHP policy must reach the
+/// 0.3 paths that random shapes can reach (attributes attached and
+/// misplaced, use-tree imports, interpolation joins, the new literal roles).
+/// Function-scoped bindings and mixin rules need well-formed surroundings;
+/// `tests/semantics.rs` drives them with dedicated generators.
+#[test]
+fn test_generator_reaches_the_0_3_paths() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mapping = sink::sink(LangPolicy::php());
+    let mut runner = TestRunner::deterministic();
+    let (mut attached, mut misplaced, mut hoisted, mut imports, mut rules, mut joins, mut texts) =
+        (0, 0, 0, 0, 0, 0, 0);
+    for _ in 0..600 {
+        let t = tree_strategy().new_tree(&mut runner).unwrap().current();
+        let (tree, src) = write(&t);
+        let mut names = Interner::new();
+        let out = lower_with(&mapping, &tree, &src, &mut names);
+        let hir = &out.hir;
+        hir_lang::walk(hir, |n| {
+            attached += usize::from(!hir.attrs(n).is_empty());
+            if let NodeRef::Item(i) = n {
+                match hir.item(i).kind {
+                    hir_lang::ItemKind::Import { .. } => imports += 1,
+                    hir_lang::ItemKind::MixinUse(d) => rules += d.rules.len(),
+                    _ => {}
+                }
+            }
+            if let NodeRef::Expr(e) = n {
+                if let Expr::Call { callee, .. } = hir.expr(e) {
+                    if let Expr::Path(p) = hir.expr(*callee) {
+                        if matches!(hir.path(*p).res, Res::Extern(_)) {
+                            joins += 1;
+                        }
+                    }
+                }
+                if let Expr::Lit(Lit::Str(_)) = hir.expr(e) {
+                    texts += 1;
+                }
+            }
+        });
+        let hoist = names.get("hoist");
+        hoisted += (1..=hir.count(IdKind::Expansion) as u32)
+            .filter_map(|i| hir.expansion(hir_lang::ExpnId::from_u32(i)))
+            .filter(|x| Some(x.name) == hoist)
+            .count();
+        misplaced += out
+            .problems
+            .iter()
+            .filter(|p| p.kind == lower_lang::ProblemKind::MisplacedAttribute)
+            .count();
+    }
+    assert!(
+        attached > 3 && misplaced > 3 && imports > 3 && joins > 20 && texts > 10,
+        "{attached} {misplaced} {hoisted} {imports} {rules} {joins} {texts}"
+    );
 }
