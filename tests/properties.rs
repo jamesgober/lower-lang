@@ -168,10 +168,19 @@ proptest! {
         prop_assert!(out.problems.iter().all(|p| p.span.end().to_usize() <= src.len()));
         prop_assert!(out.problems.windows(2).all(|w| w[0].span.start() <= w[1].span.start()));
         prop_assert!(hygienic(&out.hir));
-        let mut resolved = out.hir.clone();
-        let _ = common::resolve_locals(&mut resolved);
+        // The real resolver (resolve-lang 0.4) under the matching scoping
+        // policy: valid HIR, hygiene kept, and deterministic.
+        let scoping = if policy == 0 { resolve_lang::Policy::new() } else { resolve_lang::Policy::php() };
+        let (resolved, diags) = common::resolve(out.hir.clone(), &names, scoping);
         prop_assert!(hygienic(&resolved));
+        prop_assert!(common::hygienic(&resolved));
         prop_assert_eq!(resolved.validate(), Ok(()));
+        let (again_resolved, again_diags) = common::resolve(out.hir.clone(), &names, scoping);
+        prop_assert_eq!(format!("{diags:?}"), format!("{again_diags:?}"));
+        prop_assert_eq!(
+            hir_lang::print(&resolved, &names),
+            hir_lang::print(&again_resolved, &names)
+        );
 
         // Deterministic: a second run (fresh interner) gives the same HIR.
         let mut names2 = Interner::new();
@@ -726,6 +735,43 @@ fn test_deep_trees_lower_without_recursion() {
     assert_eq!(negs, depth);
 }
 
+/// Guards the generator: random trees must reach the 0.4 paths (place-once
+/// compound assignments and textual templates through `let_place`, union
+/// and intersection types, keyed yields, `yield from`).
+#[test]
+fn test_generator_reaches_the_0_4_paths() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mapping = sink::sink(LangPolicy::php());
+    let mut runner = TestRunner::deterministic();
+    let (mut places, mut unions, mut inters, mut keyed, mut from) = (0, 0, 0, 0, 0);
+    for _ in 0..3000 {
+        let t = tree_strategy().new_tree(&mut runner).unwrap().current();
+        let (tree, src) = write(&t);
+        let mut names = Interner::new();
+        let out = lower_with(&mapping, &tree, &src, &mut names);
+        let hir = &out.hir;
+        hir_lang::walk(hir, |n| match n {
+            NodeRef::Expr(e) => match hir.expr(e) {
+                Expr::LetPlace { .. } => places += 1,
+                Expr::Yield { key: Some(_), .. } => keyed += 1,
+                Expr::YieldFrom(_) => from += 1,
+                _ => {}
+            },
+            NodeRef::Ty(t) => match hir.ty(t) {
+                hir_lang::Ty::Union(_) => unions += 1,
+                hir_lang::Ty::Intersection(_) => inters += 1,
+                _ => {}
+            },
+            _ => {}
+        });
+    }
+    assert!(
+        places > 10 && unions > 3 && inters > 3 && keyed > 10 && from > 10,
+        "{places} {unions} {inters} {keyed} {from}"
+    );
+}
+
 /// Guards the generator: random trees under the PHP policy must reach the
 /// 0.3 paths that random shapes can reach (attributes attached and
 /// misplaced, use-tree imports, interpolation joins, the new literal roles).
@@ -739,7 +785,7 @@ fn test_generator_reaches_the_0_3_paths() {
     let mut runner = TestRunner::deterministic();
     let (mut attached, mut misplaced, mut hoisted, mut imports, mut rules, mut joins, mut texts) =
         (0, 0, 0, 0, 0, 0, 0);
-    for _ in 0..600 {
+    for _ in 0..1500 {
         let t = tree_strategy().new_tree(&mut runner).unwrap().current();
         let (tree, src) = write(&t);
         let mut names = Interner::new();

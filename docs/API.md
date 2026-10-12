@@ -1,7 +1,7 @@
 # lower-lang &mdash; API Reference
 
 > Complete reference for every public item in `lower-lang`, with examples.
-> **Status: pre-1.0 (0.3.0, PHP and Python semantics).** The surface is designed across the
+> **Status: pre-1.0 (0.4.0, textual templates, hir-lang 0.4, resolver in the loop).** The surface is designed across the
 > 0.x series and frozen at 1.0, after the LexerSketch app has lowered at least
 > three target languages through it (decision D18). See
 > [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
@@ -18,6 +18,8 @@
   - [Fields: labels, kinds, positions](#fields-labels-kinds-positions)
   - [Modifiers, roles, roots](#modifiers-roles-roots)
   - [Templates and hygiene](#templates-and-hygiene)
+  - [Textual templates](#textual-templates)
+  - [Place-once compound assignment](#place-once-compound-assignment)
   - [Origins](#origins)
   - [Effects and hoisting](#effects-and-hoisting)
   - [Function-scoped bindings (PHP)](#function-scoped-bindings-php)
@@ -48,7 +50,7 @@
 - [`TemplateId`](#templateid), [`HoleKind`](#holekind), [`TLit`](#tlit), [`LabelRef`](#labelref), [`TArg`](#targ)
 - [`templates`](#templates)
 - [`Problem`](#problem), [`ProblemKind`](#problemkind), [`HoistBlocker`](#hoistblocker), [`Context`](#context)
-- [Errors](#errors): [`LowerError`](#lowererror), [`MappingError`](#mappingerror), [`TemplateError`](#templateerror)
+- [Errors](#errors): [`LowerError`](#lowererror), [`MappingError`](#mappingerror), [`TemplateError`](#templateerror), [`SyntaxError`](#syntaxerror)
 - [Re-exports](#re-exports)
 - [Feature flags](#feature-flags)
 - [Limits](#limits)
@@ -70,17 +72,18 @@
 | [`Literals`](#literals), [`Separators`](#separators), [`LegacyOctal`](#legacyoctal) | struct, enums | How number literals are spelled. |
 | [`OpSpec`](#opspec) | enum | What an operator token lowers to. |
 | [`Join`](#join) | enum | How the pieces of an interpolated string become one string. |
-| [`Template`](#template), [`TemplateBuilder`](#templatebuilder), handles | types | Hygienic lowering templates. |
+| [`Template`](#template), [`TemplateBuilder`](#templatebuilder), handles | types | Hygienic lowering templates, written as text ([`Template::parse`](#template)) or built. |
 | [`templates`](#templates) | module | Ready-made templates for common sugar. |
 | [`Problem`](#problem), [`ProblemKind`](#problemkind), [`HoistBlocker`](#hoistblocker), [`Context`](#context) | types | What is wrong with the code, and where. |
-| [`LowerError`](#lowererror), [`MappingError`](#mappingerror), [`TemplateError`](#templateerror) | enums | Exhausted resources; refused mappings and templates. |
+| [`LowerError`](#lowererror), [`MappingError`](#mappingerror), [`TemplateError`](#templateerror), [`SyntaxError`](#syntaxerror) | enums | Exhausted resources; refused mappings, templates, and template texts. |
+| [`MAX_TEMPLATE_TEXT`](#limits), [`MAX_TEMPLATE_DEPTH`](#limits), [`MAX_TEMPLATE_SIZE`](#limits) | constants | The template limits. |
 
 ## Installation
 
 ```toml
 [dependencies]
-lower-lang = "0.3"
-hir-lang = "0.3"
+lower-lang = "0.4"
+hir-lang = "0.4"
 intern-lang = "1"
 syntax-lang = "1"
 ```
@@ -89,7 +92,7 @@ Without the standard library:
 
 ```toml
 [dependencies]
-lower-lang = { version = "0.3", default-features = false }
+lower-lang = { version = "0.4", default-features = false }
 ```
 
 ## Quick start
@@ -190,10 +193,130 @@ can capture the other. Free names a template writes (`global`) carry the mark
 and resolve at the template's definition site; host symbols (`extern_`) are
 resolved to `Res::Extern` directly.
 
-A hole used twice is copied (`Builder::copy_subtree`), since HIR is a tree. A
-template may `apply` templates registered before it, so expansion always
-terminates; each application is a nested expansion counted against
+A hole used twice is copied (`Builder::copy_subtree`), since HIR is a tree,
+so its code runs twice; a template that must evaluate a place once (`++`,
+`--`, compound assignment) names it with `let_place` instead. A template may
+`apply` templates registered before it, so expansion always terminates; each
+application is a nested expansion counted against
 [`Budget::max_expansion_depth`](#budget).
+
+### Textual templates
+
+LexerSketch sketches write templates as text in HIR's textual syntax (HIR
+spec §20, LSF2 §15.8). [`Template::parse`](#template) parses such a text into
+the same [`Template`](#template) the builder makes, and
+[`MappingBuilder::parse_template`](#mappingbuilder) parses and registers it
+(so `apply:` can name templates registered before it). The text is parsed
+once, never substituted: holes are filled with already-lowered HIR at
+instantiation, so a template cannot produce text that re-lexes differently.
+
+```text
+template  := expr
+expr      := 'return' expr? | 'throw' expr | 'await' expr | 'spawn' expr
+           | 'yield' | 'yield' expr ('=>' expr)? | 'yield' 'from' expr
+           | 'break' label? expr? | 'continue' label?
+           | 'let_place' NAME '=' postfix 'in' expr
+           | postfix ('=' expr)?
+postfix   := primary ( '(' list ')' | '.' NAME ('(' list ')')? | '[' expr ']' )*
+primary   := INT | FLOAT | STRING | CHAR | 'true' | 'false' | 'null'
+           | HOLE                         -- ${name}, ${name?}, ${name?=literal}
+           | NAME                         -- a binder in scope
+           | OPNAME ('<' policy (',' policy)* '>')? '(' expr (',' expr)* ')'
+           | 'extern:' SYMBOL | 'global:' PATH | 'apply:' NAME '(' args ')'
+           | '(' ')' | '(' expr ')' | '(' list ')' | '[' list ']'
+           | block | 'if' expr block ('else' (block | if))?
+           | 'match' expr '{' (pat ('if' expr)? '=>' expr ','?)* '}'
+           | label? 'loop' ('[' 'step' ':' expr ']')? block | LABEL block
+           | 'closure' ('[' MODE ']')? '(' ('mut'? NAME),* ')' '=>' expr
+list      := (expr | '${...' name '}'),*          -- a splice of an argument-list hole
+block     := '{' stmt* expr? '}'
+stmt      := 'let' pat (':' type)? ('=' expr)? ';' | 'defer' expr ';'
+           | '${...' name '}' ';'?               -- a splice of a statement-list hole
+           | expr ';' | block-like expr          -- if, match, loop, a block: no ';' needed
+pat       := '_' | literal | '-'INT | HOLE | 'mut'? NAME | '(' pat,* ')'
+           | 'global:' PATH ('(' pat,* ')')? | PATH '(' pat,* ')'
+type      := atom ('|' atom)* | atom ('&' atom)*
+atom      := '_' | 'any' | PRIM | HOLE | 'global:' PATH | PATH | '(' type ')'
+label     := LABEL | HOLE                        -- 'outer, or ${label}
+policy    := PRIM | ('overflow' | 'div_zero' | 'shift' | 'float_to_int') '=' VALUE
+MODE      := none | infer | by-ref | by-mut-ref | by-value
+```
+
+- **Holes.** A hole's kind follows from where it is written: an expression,
+  a pattern (`let ${pat} = …`, a `match` arm), a type (`let x: ${ty}`), a
+  label (`${label} loop`, and `break`/`continue` naming a label hole), an
+  argument list (`${...args}` in a call, tuple, or array), or statements
+  (`${...body}` in a block). A hole right after `break` is its label only
+  if it is already a label hole (`${label} loop { … break ${label} }`);
+  otherwise it is the value. Holes are numbered in order of first
+  appearance. `?` makes a hole optional and `?=<literal>` gives it a
+  default (expression holes only); any use may carry the suffix, but two
+  uses may not disagree. Hole names are lowercase letters and `_`.
+- **Binders and labels.** A name bound by `let`, `let_place`, a pattern, or
+  a closure parameter is a template binder: fresh per instantiation, marked
+  with the expansion, resolved by construction. It is in scope after its
+  `let` statement (not in its own initializer), in its arm's guard and body,
+  in the closure body, or in the `let_place` body. A label `'name` is the
+  template's own. Binders are written without an id (`x`, not `x%0`); the
+  keywords (`let`, `let_place`, `in`, `if`, `else`, `match`, `loop`,
+  `break`, `continue`, `return`, `throw`, `await`, `yield`, `from`, `spawn`,
+  `closure`, `defer`, `mut`, `true`, `false`, `null`, `_`) are not binder
+  names, and `extern`, `global`, `apply` directly before `:` are prefixes.
+- **Free names.** `global:a::b` is a marked free name resolved at the
+  template's definition site; `extern:mox.echo` is a host symbol
+  (`Res::Extern`). Any other unbound name is refused, so a typo cannot
+  silently capture a user name.
+- **Operations** are written by their OPS name (`add`, `not`, `bit_not`,
+  `pow`, `int_cast<i32>`, ...). Without `<policy>` they take the language's
+  policies (`TemplateBuilder::op`); with one they take exactly the policies
+  written and the OPS defaults for the rest (`op_with`); a policy the op does
+  not consult is refused. Policy values: `overflow = error | wrap | trap |
+  promote`, `div_zero = error | trap`, `shift = error | mask | saturate`,
+  `float_to_int = error | saturate`. An op name is an operation only before
+  `(` or `<`.
+- **`apply:name(args)`** passes one argument per hole of the applied
+  template, of that hole's kind; trailing optional holes may be left out and
+  `_` leaves an optional hole absent. Names resolve to templates registered
+  before this one (built-ins also by their LSF2 name: `while`, `do_while`,
+  `c_for`, `for_each`, `logical_and`, `logical_or`, `and_value`,
+  `or_value`, `coalesce`, `try`, `post_increment`).
+- **Limits.** At most [`MAX_TEMPLATE_TEXT`](#limits) bytes and
+  [`MAX_TEMPLATE_DEPTH`](#limits) levels of nesting; every refusal is a
+  [`TemplateError::Syntax`](#templateerror) with the byte range.
+
+```rust
+use lower_lang::{HoleKind, MappingBuilder, Template};
+
+// Mox's `yield from`, multi-line, as the sketch writes it.
+let yield_from = Template::parse("yield_from", "
+{ let g = extern:mox.iter(${from});
+  loop {
+    match extern:mox.next(g) {
+      null => break extern:mox.gen_return(g),
+      (k, v) => { yield k => v; }
+    }
+  } }")?;
+assert_eq!(yield_from.hole(0), Some(("from", HoleKind::Expr, false)));
+
+// Registered in sketch order; `apply:` names an earlier one.
+let mut b = MappingBuilder::<u8>::new();
+let _inc = b.parse_template("pre_increment", "let_place p = ${place} in p = add(p, 1)")?;
+let twice = b.parse_template("twice", "{ apply:pre_increment(${x}); apply:pre_increment(${x}) }")?;
+assert_eq!(twice.index(), 1);
+# Ok::<(), lower_lang::TemplateError>(())
+```
+
+### Place-once compound assignment
+
+A compound assignment whose operator is not an OPS op (PHP `.=` as
+`mox.concat`, `**=` as an intrinsic, `??=` through a template) is
+[`OpSpec::CompoundExtern`, `CompoundIntrinsic`, or
+`CompoundTemplate`](#opspec). It lowers to `let_place p = target in p =
+op(p, value)`: the target's operands (`$a[f()]`'s `f()`) are evaluated once,
+and the alias `p` is a `Place` binder marked with a `Desugar` expansion named
+`compound`, so no user name can capture it. Compound assignment with an OPS
+op (`Compound`, `CompoundWith`, now including `pow`) stays `Expr::Assign` with
+`op`.
 
 ### Origins
 
@@ -483,6 +606,7 @@ Every method records and returns `&mut Self` (chainable); `build` checks.
 | `name(text) -> NameRef` | stores a host or intrinsic name for `OpSpec::Extern` / `Intrinsic` |
 | `policy(policy)` | the [`LangPolicy`](#langpolicy) |
 | `template(t) -> Result<TemplateId, MappingError>` | registers a [`Template`](#template); its `apply`s must name templates registered before it, with matching arguments |
+| `parse_template(name, text) -> Result<TemplateId, TemplateError>` | parses a [template text](#textual-templates) and registers it under `name`; `apply:` names templates registered before it |
 | `template_node(kind, id, holes)` | nodes of `kind` lower through template `id`, one pick per hole in hole order |
 | `build() -> Result<Mapping<K>, MappingError>` | checks and sorts everything |
 
@@ -590,7 +714,7 @@ ones before it positional-only.
 | `Segment` | `name` (req), `args` | a path segment with generic arguments |
 | `AssocBinding` | `name`, `ty` (req) | `GenericArg::Binding` |
 | `Unary`, `Binary`, `Postfix` | `op` (req) and operands (req) | per the operator's [`OpSpec`](#opspec) |
-| `Assign` | `target`, `op`, `value` | `Expr::Assign` (compound with a binary `Compound` op) |
+| `Assign` | `target`, `op`, `value` | `Expr::Assign` (compound with a binary `Compound` op), or `let_place` for a [non-OPS compound](#place-once-compound-assignment) |
 | `RefAssign` | `target`, `source` (req) | `Expr::RefAssign` |
 | `Call` | `callee` (req), `args` (list) | `Expr::Call`; in a pattern, `Pat::Ctor` |
 | `Arg` | `name`, `value` (req) | a named, spread (`Spread`/`SpreadNamed`), or place (`Ref`) argument |
@@ -611,7 +735,9 @@ ones before it positional-only.
 | `Break`, `Continue` | `label`, `value` | jumps; a label no enclosing loop or block has is an `UnknownLabel` problem |
 | `Return` | `value` | `Expr::Return` |
 | `Throw`, `Try`, `Catch` | `value`; `body`, `catches`, `finally`; `types`, `name`, `body` | `Expr::Throw`, `Expr::Try`; a catch is an arm whose pattern is a type test (an or-pattern for several types) binding `name` |
-| `Await`, `Yield`, `Spawn` | | effects |
+| `Await`, `Spawn` | `inner` (req) | `Expr::Await`, `Expr::Spawn` |
+| `Yield` | `key`, `value` | `Expr::Yield { key, value }` (`yield $k => $v`; a key without a value yields `null`) |
+| `YieldFrom` | `inner` (req) | `Expr::YieldFrom` (delegation; evaluates to the inner generator's return value) |
 | `Closure` | `params`, `ret`, `captures`, `body` (req), `implicit` | `Expr::Closure` (`Async`, `Generator`, `Throws` modifiers) |
 | `Template` | (a [`TemplateUse`](#templateuse)) | the template's instantiation |
 | `Interp` | `parts` (list), `close`, `join: Join` | an interpolated string or heredoc: text pieces (`StrPart` tokens) and embedded expressions joined by the [`Join`](#join); `close` picks a heredoc's closing marker (indentation stripping) |
@@ -630,7 +756,12 @@ ones before it positional-only.
 (`Mut`), `SlicePat`, `TypeTestPat`.
 
 **Types**: `TupleTy`, `ArrayTy`, `SliceTy`, `RefTy { inner, region }`
-(`Mut`), `PtrTy` (`Mut`), `NullableTy`, `FnTy`, `ObjectTy`, `ImplTy`.
+(`Mut`), `PtrTy` (`Mut`), `NullableTy`, `FnTy`, `ObjectTy`, `ImplTy`,
+`UnionTy { members }` and `IntersectionTy { members }` (`int|string`,
+`A&B`: `Ty::Union` / `Ty::Intersection`, members in source order; hir-lang's
+`finish` normalizes them: flattened, sorted, repeats dropped, a single member
+collapsed; no members at all is a `MissingField` problem and an error
+type).
 
 ```rust
 use lower_lang::{Arch, Pick};
@@ -818,7 +949,7 @@ pub fn php() -> Self   // the PHP / Mox preset
 
 | Field | Default | Meaning |
 |---|---|---|
-| `overflow`, `div_zero`, `shift`, `float_to_int` | `Error` each | the OPS policies of every op that consults them (`OpSpec::Op`, template `op`) |
+| `overflow`, `div_zero`, `shift`, `float_to_int` | `Error` each | the OPS policies of every op that consults them (`OpSpec::Op`, template `op`); `shift` may be `Shift::Saturate` (PHP's rule, OPS v2, hir-lang 0.4) |
 | `throws`, `yields`, `asyncs` | `Declared` | when frames get `THROWS`, `YIELD`, `ASYNC` ([`EffectMode`](#effectmode)) |
 | `implicit_locals` | `false` | PHP: assigning to a plain variable declares it for the enclosing body |
 | `ident_patterns` | `Ident` | bare identifiers in match arms ([`IdentPatterns`](#identpatterns)) |
@@ -921,14 +1052,17 @@ assert_eq!(LegacyOctal::default(), LegacyOctal::Decimal);
 #[non_exhaustive]
 pub enum OpSpec { Op(OpKind), OpWith(Op), Compound(OpKind), CompoundWith(Op), Assign, RefAssign,
                   Identity, Borrow(BorrowKind), Deref, Await, Template(TemplateId),
-                  Extern(NameRef), Intrinsic(NameRef) }
+                  Extern(NameRef), Intrinsic(NameRef),
+                  CompoundExtern(NameRef), CompoundIntrinsic(NameRef), CompoundTemplate(TemplateId) }
 ```
 
 | Spec | Lowers to | Positions |
 |---|---|---|
 | `Op(kind)` | `Expr::Op` with the language's policies in exactly the fields `kind` consults | arity must match |
 | `OpWith(op)` | `Expr::Op` with exactly `op`'s policy (must fit the op) | arity must match |
-| `Compound(kind)`, `CompoundWith(op)` | `Expr::Assign` with a compound op (`add sub mul div floor_div rem floor_mod and or xor shl shr`) | binary |
+| `Compound(kind)`, `CompoundWith(op)` | `Expr::Assign` with a compound op (`add sub mul div floor_div rem floor_mod and or xor shl shr pow`) | binary |
+| `CompoundExtern(name)`, `CompoundIntrinsic(name)` | `let_place p = target in p = name(p, value)` (a host call or a named intrinsic); the place is evaluated once | binary |
+| `CompoundTemplate(id)` | `let_place p = target in p = template(p, value)`: the template's two expression holes receive the alias and the value | binary; the template must have exactly two expression holes |
 | `Assign`, `RefAssign` | `Expr::Assign`, `Expr::RefAssign` | binary |
 | `Identity` | the operand | prefix, postfix |
 | `Borrow(kind)`, `Deref` | `Expr::Borrow`, `Expr::Deref` | prefix |
@@ -943,9 +1077,12 @@ use lower_lang::{MappingBuilder, OpSpec};
 
 let mut b = MappingBuilder::<u8>::new();
 let concat = b.name("mox.concat");
+let coalesce = b.template(lower_lang::templates::coalesce()).expect("valid");
 b.binary_op(1, OpSpec::OpWith(Op::new(OpKind::Add).with_overflow(Overflow::Wrap)))
     .binary_op(2, OpSpec::Extern(concat))
-    .binary_op(3, OpSpec::Compound(OpKind::Mul));
+    .binary_op(3, OpSpec::Compound(OpKind::Mul))
+    .binary_op(4, OpSpec::CompoundIntrinsic(concat))   // PHP `.=`
+    .binary_op(5, OpSpec::CompoundTemplate(coalesce)); // PHP `??=`
 assert!(b.build().is_ok());
 ```
 
@@ -1003,9 +1140,21 @@ pub fn name(&self) -> &str
 pub const fn expansion_kind(&self) -> ExpnKind
 pub fn hole_count(&self) -> usize
 pub fn hole(&self, index: usize) -> Option<(&str, HoleKind, bool)>   // name, kind, optional
+pub fn hole_index(&self, name: &str) -> Option<usize>
+pub fn parse(name: &str, text: &str) -> Result<Template, TemplateError>
+pub fn desugar(self) -> Self
 ```
 
-A checked template, from [`TemplateBuilder::finish`](#templatebuilder).
+A checked template, from [`TemplateBuilder::finish`](#templatebuilder) or
+from a text: `parse` is the lazy path for a [template text](#textual-templates)
+(no `apply:`; use [`MappingBuilder::parse_template`](#mappingbuilder) for
+that). `desugar` makes it record `Desugar` expansions (LSF2's `{ text = …,
+desugar = true }`). `hole_index` finds a hole by name, for binding a node's
+fields to holes by name.
+
+**Errors (`parse`):** [`TemplateError::Syntax`](#templateerror) with a
+[`SyntaxError`](#syntaxerror) and the byte range; `TooLarge` when the result
+outgrows the template tables.
 
 ```rust
 use lower_lang::HoleKind;
@@ -1014,6 +1163,11 @@ let t = lower_lang::templates::for_each("iter", "next");
 assert_eq!(t.name(), "foreach");
 assert_eq!(t.hole(0), Some(("source", HoleKind::Expr, false)));
 assert_eq!(t.hole(1), Some(("key", HoleKind::Pat, true)));
+
+let new = lower_lang::Template::parse("new_object", "extern:mox.new(${class}, ${...args})")?;
+assert_eq!(new.hole(1), Some(("args", HoleKind::Args, true)));
+assert_eq!(new.hole_index("class"), Some(0));
+# Ok::<(), lower_lang::TemplateError>(())
 ```
 
 ## `TemplateBuilder`
@@ -1033,10 +1187,10 @@ up. `desugar` records `Desugar` expansions instead of `Template` ones.
 |---|---|
 | holes | `expr_hole(name)`, `optional_expr_hole(name, default: Option<TLit>)`, `pat_hole(name, optional)`, `ty_hole(name, optional)`, `stmts_hole(name)`, `args_hole(name)`, `label_hole(name)` |
 | binders | `binder(name)`, `mutable_binder(name)`, `label(name)` |
-| expressions | `hole`, `splice` (an argument hole, only in `call`/`method`/`tuple`/`array` lists), `lit`, `str`, `var`, `global(path)` (a marked free name, `a::b` splits), `extern_(name)` (a host symbol), `call`, `method`, `field`, `index`, `op` (language policy), `op_with` (exact policy), `assign`, `block`, `labeled_block`, `if_`, `match_`, `loop_`, `break_`, `continue_`, `return_`, `throw`, `await_`, `yield_`, `spawn`, `tuple`, `array`, `closure`, `apply` |
+| expressions | `hole`, `splice` (an argument hole, only in `call`/`method`/`tuple`/`array` lists), `lit`, `str`, `var`, `global(path)` (a marked free name, `a::b` splits), `extern_(name)` (a host symbol), `call`, `method`, `field`, `index`, `op` (language policy), `op_with` (exact policy), `assign`, `block`, `labeled_block`, `if_`, `match_`, `loop_`, `break_`, `continue_`, `return_`, `throw`, `await_`, `yield_`, `yield_kv` (`yield k => v`), `yield_from`, `spawn`, `tuple`, `array`, `closure`, `apply`, `let_place(binder, place, body)` (the place evaluated once; the binder is a `Place` binder) |
 | statements | `let_`, `expr_stmt`, `defer`, `stmts` (a statement-list hole) |
 | patterns | `pat`, `wild`, `bind`, `lit_pat`, `tuple_pat`, `ctor_pat(path, elems)` |
-| types | `ty`, `prim`, `named_ty`, `infer_ty`, `any_ty` |
+| types | `ty`, `prim`, `named_ty`, `infer_ty`, `any_ty`, `union_ty`, `intersection_ty` |
 
 An absent optional hole is its default literal if it has one; otherwise it is
 left out where its slot is optional (an `else`, a loop step, a `return` value,
@@ -1150,7 +1304,7 @@ order for [`template_node`](#mappingbuilder); `?` marks an optional hole.
 | `and_value()`, `or_value()` | `{ let t = a; if t { b } else { t } }` and the `or` form (operand-valued) | `lhs`, `rhs` |
 | `coalesce()` | `a ?? b` → `{ let t = a; if t == null { b } else { t } }` | `lhs`, `rhs` |
 | `try_operator()` | `e?` → `match e { Ok(v) => v, Err(e) => return Err(e) }` | `expr` |
-| `post_increment()` | `x++` → `{ let old = x; x = old + 1; old }` (`x` used twice: copied) | `place` |
+| `post_increment()` | `x++` → `let_place p = x in { let old = p; p = old + 1; old }` (the place evaluated once) | `place` |
 
 ```rust
 assert_eq!(lower_lang::templates::post_increment().hole(0).map(|h| h.0), Some("place"));
@@ -1262,7 +1416,9 @@ assert_eq!(b.build().unwrap_err(), MappingError::MissingField { rule: 0, field: 
 `BinderBoundTwice { binder }`, `LabelUndefined { label }`,
 `LabelDefinedTwice { label }`, `SpliceOutOfList { hole }`, `ForeignHandle`,
 `TooLarge` (more than [`MAX_TEMPLATE_SIZE`](#limits) nodes with shared
-sub-trees counted at every use).
+sub-trees counted at every use), `Syntax { at: Span, error: SyntaxError }`
+(a [template text](#textual-templates) that does not parse: the byte range
+of the text and what is wrong; `Display` gives both).
 
 ```rust
 use lower_lang::{TemplateBuilder, TemplateError};
@@ -1270,6 +1426,51 @@ let mut t = TemplateBuilder::new("t");
 let _unused = t.expr_hole("x");
 let root = t.lit(lower_lang::TLit::Null);
 assert_eq!(t.finish(root), Err(TemplateError::HoleUnused { hole: 0 }));
+
+let err = lower_lang::Template::parse("t", "{ let x = 1; y }").unwrap_err();
+assert_eq!(
+    err.to_string(),
+    "template text, bytes 13..14: unknown name (free names are written `global:name`, host symbols `extern:name`)"
+);
+```
+
+### `SyntaxError`
+
+`#[non_exhaustive]`, `Copy`: what is wrong with a template text, carried by
+`TemplateError::Syntax` with the byte range it is about.
+
+| Variant | Meaning |
+|---|---|
+| `TooLong` | the text is longer than [`MAX_TEMPLATE_TEXT`](#limits) |
+| `TooDeep` | nesting deeper than [`MAX_TEMPLATE_DEPTH`](#limits) |
+| `UnexpectedChar` | a character that starts no token (templates are ASCII outside strings) |
+| `Unterminated` | a string, character, or hole that is not closed |
+| `BadEscape` | an unknown escape (`\n \r \t \0 \\ \" \' \u{…}` are known) |
+| `BadNumber` | a malformed number, or one beyond `i64` / a finite `f64` |
+| `Expected(what)` | something else was expected here |
+| `UnknownName` | neither a binder in scope nor an operation (write `global:` or `extern:`) |
+| `BinderId` | a binder or label written with an id (`x%0`) |
+| `UnknownOp` | an operation OPS does not define, or a conversion without its target |
+| `BadPolicy` | a policy the op does not consult, an unknown or repeated one, or a target on an op that takes none |
+| `Arity { expected, found }` | the wrong number of operands |
+| `HoleKind { first, here }` | a hole used in positions of two kinds |
+| `HoleSuffix` | two uses of a hole with different `?` / `?=` suffixes |
+| `HoleDefault` | a default on a non-expression hole, or one that is not a literal |
+| `SpliceHere` | `${...name}` outside a list or a block |
+| `BoundTwice` | one pattern or closure binds a name twice |
+| `UnknownLabel` | a label no enclosing loop or block of the template defines |
+| `UnknownTemplate` | `apply:` names no template registered before |
+| `ApplyArgs` | `apply:` arguments that do not fit the template's holes |
+| `Unsupported(what)` | a construct the template subset lacks (string literal patterns) |
+
+```rust
+use lower_lang::{SyntaxError, Template, TemplateError};
+
+let Err(TemplateError::Syntax { at, error }) = Template::parse("t", "add<overflow=wrap>(1)") else {
+    unreachable!()
+};
+assert_eq!(error, SyntaxError::Arity { expected: 2, found: 1 });
+assert_eq!((at.start().to_usize(), at.end().to_usize()), (0, 3));
 ```
 
 ## Re-exports
@@ -1291,6 +1492,8 @@ assert_eq!(t.finish(root), Err(TemplateError::HoleUnused { hole: 0 }));
 | HIR nodes per lowering | `Budget::max_nodes` (default 2^24) | `LowerError::NodeBudget` |
 | Template application depth | `Budget::max_expansion_depth` (default 64) | `ExpansionTooDeep` problem |
 | Template size | `MAX_TEMPLATE_SIZE` = 2^20 nodes, shared sub-trees counted per use | `TemplateError::TooLarge` |
+| Template text length | `MAX_TEMPLATE_TEXT` = 1 MiB | `SyntaxError::TooLong` |
+| Template text nesting | `MAX_TEMPLATE_DEPTH` = 32 levels (under 256 KiB of stack unoptimized, under 64 KiB optimized) | `SyntaxError::TooDeep` |
 | Exact decimal digits of a non-decimal big integer | 1,024 | `InvalidLiteral` problem |
 | Use-tree nesting, interpolation pieces | none (iterative) | — |
 | Tree depth | none (iterative) | — |
@@ -1299,8 +1502,11 @@ assert_eq!(t.finish(root), Err(TemplateError::HoleUnused { hole: 0 }));
 
 Pre-1.0. The 0.x series may break the API; each break is listed in the
 CHANGELOG. `Arch`, `Pick`, `TokenRole`, `Modifier`, `OpSpec`, `ProblemKind`,
-`Context`, `HoistBlocker`, `Join`, the error enums, `Budget`, `Lowered`,
+`Context`, `HoistBlocker`, `Join`, the error enums (`SyntaxError` included), `Budget`, `Lowered`,
 `LangPolicy`, and `Literals` are
 `#[non_exhaustive]`, so new archetypes, picks, roles, and policies are
 additive. The exact wording of problem and error messages is not part of the
-contract; match on variants.
+contract; match on variants. The template text syntax is HIR spec §20's
+template subset; when hir-lang 0.5 ships the full textual parser, this parser
+is checked against it (decision D26), and any difference is a bug in one of
+them.

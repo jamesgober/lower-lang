@@ -13,6 +13,125 @@
 
 ---
 
+## [0.4.0] - 2026-10-12
+
+Textual templates (decision D26), hir-lang 0.4, and the resolver in the loop:
+the step that lets LexerSketch lower Mox's `echo`, `print`, `&&`, `||`, and
+`++$i` (LSF5105) on one `hir_lang` shared with resolve-lang 0.4 and
+typeck-lang 0.3.
+
+### Breaking
+
+- **Depends on `hir-lang` 0.4** (was 0.3). `Lowered::hir` is hir-lang 0.4's
+  `Hir`; a caller still on hir-lang 0.3 gets two incompatible `hir_lang`
+  crates. hir-lang 0.4's own breaking changes reach callers through the HIR:
+  `Expr::Yield { key, value }`, the new `Expr::LetPlace`/`YieldFrom` and
+  `Ty::Union`/`Intersection` forms, `BinderKind::Place`, logical-only
+  `OpKind::Not` (`BitNot` is new), and normalized unions.
+- **`Arch::Yield` has a `key` field** (`yield $k => $v`); mappings that build
+  it add `key: Pick::Absent`.
+- **The built-in `templates::post_increment()` evaluates its place once**:
+  it is now `let_place p = x in { let old = p; p = old + 1; old }`, so the
+  HIR has a `LetPlace` (and a `Place` binder) where 0.3 had two copies of the
+  place.
+- New `OpSpec` variants (`CompoundExtern`, `CompoundIntrinsic`,
+  `CompoundTemplate`), `Arch` variants (`YieldFrom`, `UnionTy`,
+  `IntersectionTy`), and the `TemplateError::Syntax` variant; all three
+  enums are `#[non_exhaustive]`, so only code that listed every variant
+  changes.
+
+### Added
+
+- **Textual templates** (HIR spec §20 template additions, LSF2 §15.7/§15.8):
+  `Template::parse(name, text)` (the lazy path) and
+  `MappingBuilder::parse_template(name, text)` (parse and register, with
+  `apply:` naming templates registered before; built-ins also by their LSF2
+  names) parse the template subset of HIR's textual syntax straight into the
+  template AST: expressions, blocks and statements, `let`, `if`/`else`,
+  `loop` with `[step: …]` and labels, `break`/`continue`, `match` with
+  patterns and guards, closures with capture modes, ops by OPS name with the
+  language's policies or exact ones (`add<overflow=wrap>(a, b)`,
+  `int_cast<i32>(x)`), literals, tuples, arrays, calls, methods, fields,
+  indexes, `yield` (keyed), `yield from`, `let_place`, `return`, `throw`,
+  `await`, `spawn`, `defer`, union and intersection types; holes `${name}`
+  (kind from position), `${name?}`, `${name?=<literal>}`, `${...name}`;
+  template binders and labels without ids, fresh per instantiation;
+  `extern:`, `global:`, `apply:`. The parser is recursive descent with a
+  nesting cap (`MAX_TEMPLATE_DEPTH` = 32) and a length cap
+  (`MAX_TEMPLATE_TEXT` = 1 MiB), never panics, is never quadratic, and
+  reports `TemplateError::Syntax { at, error: SyntaxError }` with the byte
+  range for every refusal. Every template text of `mox.lsf` parses.
+- `SyntaxError` (`#[non_exhaustive]`), `MAX_TEMPLATE_TEXT`,
+  `MAX_TEMPLATE_DEPTH`; `Template::desugar` (LSF2 `desugar = true`) and
+  `Template::hole_index` (bind node fields to holes by name, the inline
+  `[semantics.lower]` form).
+- **Compound assignment with non-OPS operators** (GAPS B2, LSF2 §15.6
+  `{ compound = { extern | intrinsic | template = … } }`):
+  `OpSpec::CompoundExtern`, `CompoundIntrinsic`, and `CompoundTemplate`
+  lower `target op= value` to `let_place p = target in p = op(p, value)`,
+  so the target's operands are evaluated once (`$a[f()] .= "!"` calls `f`
+  once). The alias is a `Place` binder marked with a `Desugar` expansion
+  named `compound`. Through `Arch::Assign`'s operator field or a
+  binary-operator node alike.
+- `TemplateBuilder::let_place`, `yield_kv`, `yield_from`, `union_ty`,
+  `intersection_ty`.
+- `Arch::YieldFrom { inner }`, `Arch::UnionTy { members }`,
+  `Arch::IntersectionTy { members }` (LSF2 `union_ty` / `intersection_ty`);
+  no members is a `MissingField` problem and an error type.
+- `pow` is a valid `Compound` op (hir-lang 0.4).
+- `resolve-lang` 0.4 as a dev-dependency: the Mox tests, the PHP-scoping
+  property, and the random-tree properties resolve through it.
+- Tests: `src/text/tests.rs` (every Mox template, the builder forms of four
+  of them, every `SyntaxError` kind, most with their byte range checked, a differential property
+  of parse against `TemplateBuilder` over random templates, arbitrary text
+  and token soup, every nesting form past the cap on a 512 KiB thread);
+  `tests/textual.rs` (Mox `&&`, `||`, `++`, `--`, `echo`, `print`, `.=`,
+  `??=`, `**=`, `yield from`, keyed `yield`, and a union parameter type,
+  lowered, validated, and resolved clean; `++$a[f()]` calls `f` three times
+  with the sketch's current `pre_increment` and once with the `let_place`
+  one; the inline `[semantics.lower]` form); `tests/hir_0_4.rs` (the 0.4
+  archetypes and op specs, union normalization, lenient repair). Random
+  trees now reach `let_place`, unions, intersections, keyed yields, and
+  `yield from` (checked). Example `textual`; benchmark group
+  `template_text`.
+
+### Changed
+
+- hir-lang 0.4's behaviour reaches lowering as follows, each covered by a
+  test: union and intersection types come back normalized from
+  `finish_lenient` (sorted, flattened, repeats dropped, one member
+  collapsed); lenient repair reports a duplicate binding at every repeat (an
+  or-pattern's alternatives sharing a binder report each one); orphan
+  reporting changed in hir-lang but lowering produces no orphans.
+- `OpKind::Not` in templates and `OpSpec::Op` is logical negation (hir-lang
+  0.4); use `OpKind::BitNot` for the bitwise complement.
+- A template's `int_cast` takes `overflow = error` under a `promote`
+  language policy, as casts already did (HIR refuses `promote` on a static
+  result).
+
+### Fixed
+
+- **`Arch::RefAssign` was never finished**: its operands were lowered and
+  then dropped, so `$b = &$a` through the archetype gave orphaned HIR
+  (internal validation problems) instead of `Expr::RefAssign`. It now
+  lowers like the `=&` operator spec.
+
+### Migration
+
+| 0.3 | 0.4 |
+|---|---|
+| `hir-lang = "0.3"` | `hir-lang = "0.4"` |
+| `Arch::Yield { value }` | `Arch::Yield { key: Pick::Absent, value }` |
+| `match expr { Expr::Yield(v) => … }` on the output | `Expr::Yield { key, value }`, plus `Expr::YieldFrom` and `Expr::LetPlace` arms |
+| `OpSpec::Op(OpKind::Not)` for a bitwise `~` | `OpSpec::Op(OpKind::BitNot)` |
+| `.=` as a hook or an `Extern` that evaluates the place twice | `OpSpec::CompoundExtern(name)` / `CompoundIntrinsic(name)` |
+| `??=` | `OpSpec::CompoundTemplate(coalesce)` |
+| a template built with `TemplateBuilder` from a sketch's text | `MappingBuilder::parse_template(name, text)` |
+| `{ ${place} = add(${place}, 1); ${place} }` (place evaluated three times) | `let_place p = ${place} in p = add(p, 1)` |
+| a test resolver over `lookup_local` | `resolve_lang::Resolver::new(Policy::php()).resolve(hir, &names)` |
+
+---
+
 ## [0.3.0] - 2026-10-08
 
 PHP and Python semantics before the Mox demo (ISSUES P15): PHP scoping,
@@ -191,7 +310,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/lower-lang/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lower-lang/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/lower-lang/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/lower-lang/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/lower-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/lower-lang/releases/tag/v0.1.0

@@ -18,7 +18,7 @@
 
 <div align="left">
     <p>
-        <strong>lower-lang</strong> turns a lossless syntax tree into HIR. A language describes what its constructs <em>mean</em> as data &mdash; a mapping from node kinds to a small catalogue of semantic <strong>archetypes</strong> (binders, scopes, declarations, control, expressions, patterns, types), operator tables with their overflow and division policies, and hygienic <strong>templates</strong> for sugar such as <code>while</code>, <code>for-each</code>, <code>&amp;&amp;</code>, and <code>??</code> &mdash; and lower-lang builds the HIR, records where every node came from, and validates the result with <a href="https://crates.io/crates/hir-lang"><code>hir-lang</code></a>.
+        <strong>lower-lang</strong> turns a lossless syntax tree into HIR. A language describes what its constructs <em>mean</em> as data &mdash; a mapping from node kinds to a small catalogue of semantic <strong>archetypes</strong> (binders, scopes, declarations, control, expressions, patterns, types), operator tables with their overflow and division policies, and hygienic <strong>templates</strong> for sugar such as <code>while</code>, <code>for-each</code>, <code>&amp;&amp;</code>, and <code>??</code>, written as HIR template text or built in code &mdash; and lower-lang builds the HIR, records where every node came from, and validates the result with <a href="https://crates.io/crates/hir-lang"><code>hir-lang</code></a>.
     </p>
     <p>
         It is the L3 stage of LexerSketch: declaring a language's semantics instead of hand-writing its compiler is what lets a sketch become a running language. Lowering is generic over the tree's kind type, so any <a href="https://crates.io/crates/syntax-lang"><code>syntax-lang</code></a> tree lowers &mdash; one forged by <a href="https://crates.io/crates/lang-forge"><code>lang-forge</code></a>, or one a hand-written parser built. Half-typed code is normal input: every broken construct becomes an HIR error node and a problem with its source span, and the rest of the file is still lowered.
@@ -26,10 +26,10 @@
     <br>
     <hr>
     <p>
-        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, three dependencies, all from the family: <a href="https://crates.io/crates/syntax-lang"><code>syntax-lang</code></a> 1, <a href="https://crates.io/crates/hir-lang"><code>hir-lang</code></a> 0.3, and <a href="https://crates.io/crates/intern-lang"><code>intern-lang</code></a> 1.
+        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, three dependencies, all from the family: <a href="https://crates.io/crates/syntax-lang"><code>syntax-lang</code></a> 1, <a href="https://crates.io/crates/hir-lang"><code>hir-lang</code></a> 0.4, and <a href="https://crates.io/crates/intern-lang"><code>intern-lang</code></a> 1.
     </p>
     <blockquote>
-        <strong>Status: 0.3.0 (PHP and Python semantics).</strong> The archetype catalogue, the mapping model, programmatic hygienic templates, budgets, origins, and lenient validation are implemented, plus the PHP semantics the Mox demo needs: function-scoped <code>foreach</code>/<code>catch</code> variables, interpolated strings and heredocs, a literal decoding table (raw strings, PHP 7.3 heredoc indentation, hex floats, legacy octal, digit separators, 64-bit overflow), text-keyed operator tables, nested <code>use</code> trees, trait <code>insteadof</code>/<code>as</code> rules, and attributes. Field labels from LSF2 sketches are supported through a <code>Labeler</code> hook (lang-forge 1.x trees have none yet, so mappings address children by kind and position), and textual templates arrive with hir-lang's textual syntax. The API is frozen at 1.0, after the LexerSketch app has lowered at least three target languages through it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and the <a href="./dev/ROADMAP.md"><code>ROADMAP</code></a>.
+        <strong>Status: 0.4.0 (textual templates, hir-lang 0.4, resolver in the loop).</strong> The archetype catalogue, the mapping model, hygienic templates, budgets, origins, and lenient validation are implemented, with the PHP semantics the Mox demo needs (function-scoped <code>foreach</code>/<code>catch</code> variables, interpolated strings and heredocs, a literal decoding table, text-keyed operator tables, nested <code>use</code> trees, trait rules, attributes). New in 0.4: <strong>templates written as text</strong> in HIR's template syntax (<code>Template::parse</code>, decision D26, ahead of hir-lang 0.5's full textual parser, which this front end will be checked against), the hir-lang 0.4 forms (place-once <code>let_place</code>, keyed <code>yield</code> and <code>yield from</code>, union and intersection types), and compound assignment with non-OPS operators (PHP <code>.=</code>, <code>**=</code>, <code>??=</code>) that evaluates its place once. The tests resolve lowered HIR through <a href="https://crates.io/crates/resolve-lang"><code>resolve-lang</code></a> 0.4 (a dev-dependency only). Field labels from LSF2 sketches are supported through a <code>Labeler</code> hook (lang-forge 1.x trees have none yet, so mappings address children by kind and position). The API is frozen at 1.0, after the LexerSketch app has lowered at least three target languages through it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and the <a href="./dev/ROADMAP.md"><code>ROADMAP</code></a>.
     </blockquote>
 </div>
 
@@ -40,7 +40,8 @@
 
 - A **[`Mapping`](./docs/API.md#mapping)** is a language's semantics as data, built with a [`MappingBuilder`](./docs/API.md#mappingbuilder). It mirrors LexerSketch's LSF2 `[semantics]` sections: node kinds to **[archetypes](./docs/API.md#arch)** (`[semantics.bind]`), **[templates](./docs/API.md#template)** (`[semantics.lower]`), and **[operators](./docs/API.md#opspec)** with their policies (`[semantics.ops]`), plus the token roles, modifiers (`mut`, `async`, `&`, `...`), and path roots the archetypes read.
 - An **[`Arch`](./docs/API.md#arch)** says what a node means and where its parts are: each field is a **[`Pick`](./docs/API.md#pick)** &mdash; a child by host field label, or by position or kind for trees without labels.
-- A **[`Template`](./docs/API.md#template)** is a small HIR-shaped AST with `${field}` holes, built with a [`TemplateBuilder`](./docs/API.md#templatebuilder). Every instantiation records its own HIR expansion; the binders it introduces carry that expansion's hygiene mark. [`templates`](./docs/API.md#templates) has the common ones: `while`, `do-while`, C `for`, `for-each`, `&&`, `||`, `??`, `?`, `x++`.
+- A **[`Template`](./docs/API.md#template)** is a small HIR-shaped AST with `${field}` holes, written as **[text](./docs/API.md#textual-templates)** in HIR's template syntax (`Template::parse("bool_and", "if ${lhs} { not(not(${rhs})) } else { false }")`, `MappingBuilder::parse_template`) or built with a [`TemplateBuilder`](./docs/API.md#templatebuilder). Every instantiation records its own HIR expansion; the binders it introduces carry that expansion's hygiene mark. [`templates`](./docs/API.md#templates) has the common ones: `while`, `do-while`, C `for`, `for-each`, `&&`, `||`, `??`, `?`, `x++`.
+- **Places are evaluated once.** `let_place p = ${place} in p = add(p, 1)` names a place (`$a[f()]`) once for reads and writes (HIR `LetPlace`); compound assignment with a host function, an intrinsic, or a template ([`OpSpec::CompoundExtern` / `CompoundIntrinsic` / `CompoundTemplate`](./docs/API.md#place-once-compound-assignment): PHP `.=`, `**=`, `??=`) lowers that way, and so does the built-in `x++`.
 - **PHP semantics** are policy and archetypes, not special cases: [`LangPolicy::php()`](./docs/API.md#langpolicy) turns on function-scoped `foreach`/`catch` variables, implicit locals, promote-to-float integers, and PHP number spelling; [`Arch::Interp`](./docs/API.md#interpolated-strings-and-heredocs) joins string segments, [`Arch::UseTree`](./docs/API.md#use-trees-mixin-rules-attributes) flattens group imports, [`Arch::MixinRule`](./docs/API.md#arch) lowers trait `insteadof`/`as`, and [`Arch::Attr`](./docs/API.md#arch) attaches attributes.
 - **[`lower`](./docs/API.md#lower)** is the one-call entry point; [`Lowerer`](./docs/API.md#lowerer) adds a [`Budget`](./docs/API.md#budget), a compilation unit, and field labels. The result is a **[`Lowered`](./docs/API.md#lowered)**: a valid `hir_lang::Hir` and every **[`Problem`](./docs/API.md#problem)** in source order.
 
@@ -52,7 +53,10 @@ What it guarantees, and how each guarantee is checked:
 |---|---|
 | Lowering never panics and always yields valid HIR, on any tree. | Property tests lower 512 random trees per run (random kinds and shapes over a mapping with most archetypes, error nodes, unmapped kinds, every template, two language policies) and 512 trees with spans outside the source or off character boundaries; every result re-validates. 256 random token soups per run, parsed by lang-forge into deep half-typed trees, lower the same way. Every prefix of a program (typing it one character at a time) lowers. |
 | Every node and binder has an origin inside the source, through template expansions. | Checked on every result of every property test and integration test: each node's span lies in the source and each expansion it names exists. |
-| Templates are hygienic: their names never capture or are captured by user names. | Property tests run a resolver (`lookup_local` + `resolve`) over every random result and check that every resolved reference names a binder with its own hygiene mark; integration tests put user variables named like the templates' temporaries (`it`, `t`, `old`) next to `for-each`, `??`, and `x++`. |
+| Templates are hygienic: their names never capture or are captured by user names. | Property tests resolve every random result through the real resolver, [`resolve-lang`](https://crates.io/crates/resolve-lang) 0.4 (lexical policy or PHP's, matching the lowering policy), and check that every resolved reference names a binder with its own hygiene mark and that resolution is deterministic; integration tests put user variables named like the templates' temporaries (`it`, `t`, `old`) next to `for-each`, `??`, and `x++`, and the Mox tests resolve under `Policy::php()`. |
+| A template text means exactly what the builder would build. | A differential property test generates 512 random templates per run (every expression, statement, pattern, and type form, holes of every kind, binders, labels, closures, `let_place`, keyed `yield`), renders each as text and builds it with `TemplateBuilder` side by side, and checks that parsing the text gives the same template (compared in a canonical form). Every template text of the Mox sketch parses, and the ones that matter for the demo (`&&`, `\|\|`, `++`, `--`, `echo`, `print`, `yield from`) lower into HIR that validates and resolves with no diagnostics. |
+| Hostile template text never panics, overflows the stack, or runs long. | Property tests feed 512 arbitrary strings and 512 token soups of the template vocabulary per run; parsing is recursive descent with a nesting cap (`MAX_TEMPLATE_DEPTH` = 32), checked for 16 nesting forms past the cap on a 512 KiB thread, and a length cap (`MAX_TEMPLATE_TEXT` = 1 MiB); every lookup is a sorted-map lookup, so parsing is never quadratic. Every refusal is a `TemplateError::Syntax` with the byte range; tests cover every error kind and pin the range for most. |
+| Places are evaluated once. | Tests count the index expressions and calls in lowered Mox code: `$a[$k] .= …`, `??=`, `**=`, `++$i`, `$i++`, `--$i`, `$i--` each evaluate their place once, and `++$a[f()]` calls `f` once with the `let_place` template where the sketch's current text calls it three times. |
 | Lowering preserves meaning. | A property test generates random calc programs (assignments, arithmetic, comparisons, `&&`/`||`, `if`/`else`, counted `while` loops), evaluates them directly, renders them as text, parses them with lang-forge, lowers them, and evaluates the HIR: the printed values agree, 256 programs per run. |
 | PHP and Python semantics match independent references. | Property tests check function-scoped `foreach`/`catch` bindings (random destructuring `var`, `foreach`, and `catch`, nested, with by-reference bindings) against a reference scope model, interpolated strings against a reference concatenation, heredoc indentation against PHP 7.3's rule, integer literals of every radix and separator policy against a `u128` reference, and nested use trees against a recursive flattener. Random trees reach the 0.3 paths (attributes attached and misplaced, use trees, interpolation joins, decoded texts) on every run, under the PHP policy as well. |
 | Lowering is deterministic. | Every random tree is lowered twice with fresh interners; the printed HIR with origins, the binders, and the problems are identical. |
@@ -66,8 +70,8 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-lower-lang = "0.3"
-hir-lang = "0.3"      # the output
+lower-lang = "0.4"
+hir-lang = "0.4"      # the output
 intern-lang = "1"     # names
 syntax-lang = "1"     # the input
 ```
@@ -76,7 +80,7 @@ Without the standard library:
 
 ```toml
 [dependencies]
-lower-lang = { version = "0.3", default-features = false }
+lower-lang = { version = "0.4", default-features = false }
 ```
 
 <hr>
@@ -181,6 +185,38 @@ assert_eq!(names.resolve(first.name), Some("while"));
 # Ok::<(), lower_lang::MappingError>(())
 ```
 
+### Templates as text
+
+LexerSketch sketches write their sugar as template text (LSF2
+`[semantics.templates]`). The text is parsed once into a template, never
+substituted; holes take their kind from where they are written:
+
+```rust
+use lower_lang::{HoleKind, MappingBuilder, OpSpec, Template};
+
+// PHP's `&&` returns a bool.
+let and = Template::parse("bool_and", "if ${lhs} { not(not(${rhs})) } else { false }")?;
+assert_eq!(and.hole(0), Some(("lhs", HoleKind::Expr, false)));
+
+// Registered in sketch order; `++$x` evaluates its place once.
+let mut b = MappingBuilder::<u8>::new();
+let pre_inc = b.parse_template("pre_increment", "let_place p = ${place} in p = add(p, 1)")?;
+let echo = b.parse_template("echo", "extern:mox.echo(${...values})")?;
+b.prefix_op(1, OpSpec::Template(pre_inc));
+let concat = b.name("mox.concat");
+b.binary_op(2, OpSpec::CompoundIntrinsic(concat)); // `.=`, place evaluated once
+let _ = echo;
+assert!(b.build().is_ok());
+
+// Errors carry the byte range.
+let err = Template::parse("t", "add(${x})").unwrap_err();
+assert_eq!(err.to_string(), "template text, bytes 0..3: the operation takes 2 operands, 1 given");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+[`examples/textual.rs`](./examples/textual.rs) lowers a small Mox program
+through such templates and prints the HIR.
+
 ### Trees from lang-forge
 
 lang-forge 1.x trees have no field labels yet, so a mapping addresses a
@@ -202,6 +238,7 @@ Runnable programs in [`examples/`](./examples):
 | [`calc`](./examples/calc.rs) | The Tier-1 path end to end: an `.lsf` schematic forged by lang-forge, a mapping, a program and a half-typed one lowered, printed with origins and problems. |
 | [`php`](./examples/php.rs) | `LangPolicy::php()` on a Mox function: a group `use`, an attribute, `foreach` variables still visible after the loop, an interpolated string and an indented heredoc, PHP octal and separators. |
 | [`hygiene`](./examples/hygiene.rs) | A Mox-style `foreach` through the built-in `for_each` template next to a user variable `$it`; a toy resolver shows the user's `$it` and the template's `it` never meet. The tree is built with syntax-lang's `Builder`. |
+| [`textual`](./examples/textual.rs) | Mox's sugar as template text: `&&`, `++`/`--` with `let_place` (the place evaluated once), `echo`, and `.=` through `OpSpec::CompoundIntrinsic`; prints the HIR. |
 
 <hr>
 <br>
@@ -222,24 +259,28 @@ profile. Elements are syntax-tree nodes plus tokens (trivia included).
 
 | Benchmark | Input | Time | Throughput |
 |---|---|---:|---:|
-| `calc/100k` | 177,101 elements (189 KB of calc) | ~11.3 ms | ~15.7 M elements/s |
-| `calc/1m` | 1,771,001 elements (1.9 MB) → 748,002 HIR nodes | ~139 ms | ~12.8 M elements/s |
-| `templates/100k` | 93,001 elements, mostly `while` + `&&`/`\|\|` templates | ~7.7 ms | ~12 M elements/s |
-| `templates/1m` | 930,001 elements | ~96 ms | ~9.7 M elements/s |
-| `deep/100k_prefix_chain` | one 100,000-deep chain (200,004 elements) | ~30 ms | ~6.7 M elements/s |
-| `php/100k` | 169,050 elements (245 KB of Mox): group `use`, `foreach` with function-scoped variables, interpolated strings, heredocs, try/catch | ~18.8 ms | ~9.0 M elements/s |
-| `php/1m` | 1,690,500 elements (2.5 MB) | ~233 ms | ~7.3 M elements/s |
+| `calc/100k` | 177,101 elements (189 KB of calc) | ~9.3 ms | ~19 M elements/s |
+| `calc/1m` | 1,771,001 elements (1.9 MB) → 748,002 HIR nodes | ~122 ms | ~14.5 M elements/s |
+| `templates/100k` | 93,001 elements, mostly `while` + `&&`/`\|\|` templates | ~5.5 ms | ~17 M elements/s |
+| `templates/1m` | 930,001 elements | ~78 ms | ~11.9 M elements/s |
+| `deep/100k_prefix_chain` | one 100,000-deep chain (200,005 elements) | ~28 ms | ~7.2 M elements/s |
+| `php/100k` | 169,050 elements (245 KB of Mox): group `use`, `foreach` with function-scoped variables, interpolated strings, heredocs, try/catch | ~15 ms | ~11 M elements/s |
+| `php/1m` | 1,690,500 elements (2.5 MB) | ~194 ms | ~8.7 M elements/s |
+| `template_text/mox` | the 19 template texts of the Mox sketch (783 bytes), parsed and registered | ~20 µs | ~37 MiB/s |
+| `template_text/large` | one 1 MiB template text (12,878 statements, about 155,000 template nodes) | ~23 ms | ~43 MiB/s |
 
-Of the `calc/1m` time, measured separately: hir-lang's validation is about
-20 ms and hir-lang's node building about 30 ms (its own published figure for a
-similar size); the rest is lowering's traversal, interning, and dispatch.
-The 0.3.0 figures were taken while other builds ran on the same machine, so
-they are noisy (criterion's comparison against the 0.2.0 run, itself taken
-under load, reports the 0.2 benchmarks 50–60% faster, which is mostly load,
-not code). The PHP policy's per-binding hoisting (a temporary, a `Desugar`
-expansion, and an assignment for every `foreach`/`catch` variable) is the
-main reason `php/*` is slower per element than `calc/*`. The release gate
-re-measures on Windows and Linux.
+These are one run of the 0.4.0 benchmarks while other builds shared the
+machine; run-to-run noise was up to about 20%, so treat them as rough. In
+A/B runs in one session, lowering with the 0.4 code and with the 0.3 code
+(both on hir-lang 0.4) was within that noise; moving the 0.3 code from
+hir-lang 0.3 to 0.4 measured about 5% slower on `calc/100k` (hir-lang's
+validation) and unchanged on `templates/100k` and `deep`. Of the `calc/1m`
+time, hir-lang's validation and node building are roughly 50 ms (measured
+for 0.3.0); the rest is lowering's traversal, interning, and dispatch. The
+PHP policy's per-binding hoisting is the main reason `php/*` is slower per
+element than `calc/*`. Template text parsing is linear: the 1 MiB text parses
+at about the rate of the small ones. The release gate re-measures on Windows
+and Linux.
 
 ```bash
 cargo bench --bench bench
@@ -268,9 +309,17 @@ cargo bench --bench bench
   instantiation with the expansion's mark and referenced by binder id; its free
   names carry the mark too and resolve at the definition site; host symbols
   (`extern_`) are pre-resolved. User code in holes keeps its own (root) marks.
-- **Holes used twice are copied.** HIR is a tree, so the second use of a hole
-  (`x++` reads and writes `x`) is a `copy_subtree` copy, charged against the
-  node budget.
+- **Holes used twice are copied; places are named once.** HIR is a tree, so
+  the second use of a hole is a `copy_subtree` copy, charged against the node
+  budget, and its code runs twice. Where that is wrong (`++`, `--`, compound
+  assignment), the template names the place with `let_place`, so its
+  operands are evaluated once.
+- **Template text is parsed, never substituted** (decision D26). The
+  parser builds the same template AST the builder does; holes are filled
+  with already-lowered HIR, so a template cannot produce text that re-lexes
+  differently. It parses the template subset of HIR spec §20 ahead of
+  hir-lang 0.5, which ships the full textual parser; this front end will be
+  checked against it then.
 - **Templates are acyclic by construction.** A template may apply only
   templates registered before it, so expansion terminates; a depth budget
   bounds long chains anyway, and a cut chain keeps the user's code attached.
@@ -303,8 +352,15 @@ generators, map literals, interpolated strings, heredocs, function-scoped
 their property tests against references (function-scoped bindings,
 interpolation, heredocs, integer literals, use trees);
 [`tests/archetypes.rs`](./tests/archetypes.rs) covers the rest of the
-catalogue and every problem kind; [`tests/properties.rs`](./tests/properties.rs)
-holds the property tests and the reference evaluator. Every `rust` example in
+catalogue and every problem kind; [`tests/hir_0_4.rs`](./tests/hir_0_4.rs)
+covers the hir-lang 0.4 forms (unions and intersections, keyed `yield` and
+`yield from`, place-once compounds, lenient repair);
+[`tests/textual.rs`](./tests/textual.rs) parses every template text of the Mox
+sketch and lowers Mox code through them into HIR that validates and resolves
+through resolve-lang; the template text parser's own tests and its
+differential property are in `src/text/tests.rs`;
+[`tests/properties.rs`](./tests/properties.rs) holds the property tests and
+the reference evaluator. Every `rust` example in
 this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a
 doctest.
 

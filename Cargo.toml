@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "lower-lang"
-version = "0.3.0"
+version = "0.4.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -57,7 +57,7 @@ std = ["hir-lang/std", "syntax-lang/std", "intern-lang/std"]
 syntax-lang = { version = "1", default-features = false }
 # The output: HIR. Lowering builds it with hir-lang's `Builder`, records one
 # expansion per template instantiation, and validates with `finish_lenient`.
-hir-lang = { version = "0.3", default-features = false }
+hir-lang = { version = "0.4", default-features = false }
 # Names: HIR names are `intern_lang::Symbol`s of the session's interner, which
 # the caller passes in so names line up with the rest of the front end.
 intern-lang = { version = "1", default-features = false }
@@ -71,6 +71,9 @@ proptest  = "1"
 # The worked example language in the tests, example, and benchmarks is forged
 # from an `.lsf` schematic by lang-forge (registry dev-dependency, never a path).
 lang-forge = "1.0.1"
+# Name resolution in the loop: the Mox tests and the random-tree properties
+# resolve lowered HIR through the real resolver (registry, never a path).
+resolve-lang = "0.4"
 
 
 # BENCHMARKS

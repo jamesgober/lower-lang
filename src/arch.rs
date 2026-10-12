@@ -707,10 +707,19 @@ pub enum Arch<K> {
         /// Required: the awaited value.
         inner: Pick<K>,
     },
-    /// `yield v`.
+    /// `yield v`, or `yield k => v` (PHP and Mox generators). A key without
+    /// a value yields `null` under that key.
     Yield {
+        /// The explicit key.
+        key: Pick<K>,
         /// The yielded value.
         value: Pick<K>,
+    },
+    /// `yield from g`: delegate to an inner generator or iterable; evaluates
+    /// to its return value.
+    YieldFrom {
+        /// Required: the inner generator or iterable.
+        inner: Pick<K>,
     },
     /// `spawn e` — starts a task running the callable `e`.
     Spawn {
@@ -910,6 +919,21 @@ pub enum Arch<K> {
         /// List: bounds.
         bounds: Pick<K>,
     },
+    /// `A | B | C` (PHP union types). Members are lowered in source order;
+    /// hir-lang's `finish` puts them in canonical form (flattened, sorted,
+    /// repeats dropped, `null` hoisted into `Nullable`, one member
+    /// collapsed). No members at all is a
+    /// [`MissingField`](crate::ProblemKind::MissingField) problem.
+    UnionTy {
+        /// List: the member types.
+        members: Pick<K>,
+    },
+    /// `A & B` (PHP intersection types), normalized like
+    /// [`UnionTy`](Self::UnionTy).
+    IntersectionTy {
+        /// List: the member types.
+        members: Pick<K>,
+    },
 }
 
 impl<K> Arch<K> {
@@ -1050,6 +1074,7 @@ impl<K> Arch<K> {
             Self::Catch { .. } => "catch",
             Self::Await { .. } => "await",
             Self::Yield { .. } => "yield",
+            Self::YieldFrom { .. } => "yield from",
             Self::Spawn { .. } => "spawn",
             Self::Closure { .. } => "closure",
             Self::Template(_) => "template",
@@ -1074,6 +1099,8 @@ impl<K> Arch<K> {
             Self::FnTy { .. } => "function type",
             Self::ObjectTy { .. } => "object type",
             Self::ImplTy { .. } => "impl type",
+            Self::UnionTy { .. } => "union type",
+            Self::IntersectionTy { .. } => "intersection type",
         }
     }
 }

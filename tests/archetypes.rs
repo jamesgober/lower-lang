@@ -1622,6 +1622,7 @@ fn test_closures_calls_members_and_misc_expressions() {
     b.node(
         K(175),
         Arch::Yield {
+            key: Pick::Absent,
             value: Pick::Back(0),
         },
     );
@@ -2195,7 +2196,11 @@ fn test_builtin_sugar_templates() {
         es.iter().any(|e| matches!(e, Expr::Return(Some(_)))),
         "`?` returns the error"
     );
-    // `n++` reads and writes `n`: the place hole was used twice (copied).
+    // `n++` names its place once (`let_place`), reading and writing the alias.
+    assert!(
+        es.iter().any(|e| matches!(e, Expr::LetPlace { .. })),
+        "`n++` evaluates its place once"
+    );
     let n = names.intern("n");
     let n_uses = (0..hir.count(IdKind::Path))
         .map(|i| *hir.path(hir_lang::PathId::from_index(i).unwrap()))
@@ -2205,7 +2210,7 @@ fn test_builtin_sugar_templates() {
                 .is_some_and(|s| s.name.sym == n)
         })
         .count();
-    assert_eq!(n_uses, 2);
+    assert_eq!(n_uses, 1);
     // Template temporaries are bound and used in-template only, never by mark-less names.
     for i in 0..hir.count(IdKind::Binder) {
         let binder = hir
@@ -2213,7 +2218,7 @@ fn test_builtin_sugar_templates() {
             .unwrap();
         if !binder.name.mark.is_root() {
             assert!(hir.expansion(binder.name.mark).is_some());
-            assert_eq!(binder.kind, BinderKind::Local);
+            assert!(matches!(binder.kind, BinderKind::Local | BinderKind::Place));
         }
     }
     let _ = TLit::Null;

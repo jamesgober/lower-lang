@@ -323,10 +323,11 @@ pub fn try_operator() -> Template {
     done(t, root, "?")
 }
 
-/// `x++` as an expression (C, PHP): `{ let old = x; x = old + 1; old }`.
+/// `x++` as an expression (C, PHP):
+/// `let_place p = x in { let old = p; p = add(old, 1); old }`.
 ///
-/// `x` is evaluated twice (once read, once written); use it for plain
-/// variables, where that is invisible. Holes: `place` (expression).
+/// The place's operands are evaluated once (HIR `LetPlace`), so `$a[f()]++`
+/// calls `f` once. Holes: `place` (expression).
 ///
 /// # Examples
 ///
@@ -337,22 +338,24 @@ pub fn try_operator() -> Template {
 pub fn post_increment() -> Template {
     let mut t = TemplateBuilder::new("post++").desugar();
     let place = t.expr_hole("place");
+    let alias = t.binder("p");
     let old = t.binder("old");
-    let read = t.hole(place);
+    let target = t.hole(place);
+    let read = t.var(alias);
     let p = t.bind(old);
     let decl = t.let_(p, None, Some(read));
-    let target = t.hole(place);
     let cur = t.var(old);
     let one = t.lit(TLit::Int(1));
     let sum = t.op(OpKind::Add, &[cur, one]);
-    let write = t.assign(target, sum);
+    let write_to = t.var(alias);
+    let write = t.assign(write_to, sum);
     let write = t.expr_stmt(write);
     let result = t.var(old);
-    let root = t.block(&[decl, write], Some(result));
+    let body = t.block(&[decl, write], Some(result));
+    let root = t.let_place(alias, target, body);
     done(t, root, "post++")
 }
 
-/// Every built-in, for the tests.
 #[cfg(test)]
 pub(crate) fn all() -> alloc::vec::Vec<Template> {
     alloc::vec![

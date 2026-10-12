@@ -18,7 +18,7 @@ use lower_lang::{
 use super::writer::K;
 
 pub const TOKEN_KINDS: std::ops::RangeInclusive<u16> = 1..=49;
-pub const NODE_KINDS: std::ops::RangeInclusive<u16> = 100..=208;
+pub const NODE_KINDS: std::ops::RangeInclusive<u16> = 100..=213;
 pub const ERROR_KIND: K = K(197);
 pub const ROOT: K = K(100);
 
@@ -77,6 +77,9 @@ pub const TEXTS: &[&str] = &[
     "0x1.8p3",
     "0xFFFFFFFFFFFFFFFFFF",
     "9223372036854775808",
+    ".=",
+    "??=",
+    "**=",
 ];
 
 fn k(i: u16) -> K {
@@ -186,6 +189,24 @@ pub fn sink(policy: LangPolicy) -> Mapping<K> {
         .binary_op_text("-", OpSpec::Op(OpKind::Sub))
         .binary_op_text("%", OpSpec::Op(OpKind::Rem))
         .prefix_op_text("-", OpSpec::Op(OpKind::Neg));
+    // 0.4: compound assignment through non-OPS operators (`let_place`), and
+    // a textual template for prefix `++`.
+    let pow = b.name("pow");
+    let pre_inc = b
+        .parse_template("pre_increment", "let_place p = ${place} in p = add(p, 1)")
+        .unwrap();
+    b.binary_op_text(".=", OpSpec::CompoundExtern(echo))
+        .binary_op_text("??=", OpSpec::CompoundTemplate(co))
+        .binary_op_text("**=", OpSpec::CompoundIntrinsic(pow))
+        .prefix_op_text("++", OpSpec::Template(pre_inc));
+    let textual = b
+        .parse_template(
+            "textual",
+            "{ let t: i64 | str = ${cond}; let u: Countable & Traversable = t; \
+             let_place p = ${place} in p = add<overflow=wrap>(p, u); \
+             yield t => apply:until(${cond}, ${body}, _); yield from ${body} }",
+        )
+        .unwrap();
     let interp_all = {
         let mut t = TemplateBuilder::new("interp");
         let parts = t.args_hole("parts");
@@ -461,7 +482,10 @@ pub fn sink(policy: LangPolicy) -> Mapping<K> {
         }, // 171
         Arch::Defer { body: n(0) },  // 172
         Arch::Await { inner: n(0) }, // 173
-        Arch::Yield { value: n(0) }, // 174
+        Arch::Yield {
+            key: Pick::Absent,
+            value: n(0),
+        }, // 174
         Arch::Spawn { inner: n(0) }, // 175
         Arch::Throw { value: n(0) }, // 176
         Arch::Cast {
@@ -578,6 +602,19 @@ pub fn sink(policy: LangPolicy) -> Mapping<K> {
             join: Join::Template(and),
         },
     );
+    // 0.4 archetypes: union and intersection types, `yield from`, keyed
+    // `yield`, a textual template.
+    b.node(k(209), Arch::UnionTy { members: all });
+    b.node(k(210), Arch::IntersectionTy { members: all });
+    b.node(k(211), Arch::YieldFrom { inner: n(0) });
+    b.node(
+        k(212),
+        Arch::Yield {
+            key: n(0),
+            value: n(1),
+        },
+    );
+    b.template_node(k(213), textual, &[n(0), n(1), back]);
     b.template_node(k(191), w, &[n(0), back, Pick::Kind(k(16))]);
     b.template_node(k(192), fe, &[n(0), Pick::Before(k(37)), n(1), back, a]);
     b.template_node(k(193), cf, &[Pick::Kind(k(109)), n(1), n(2), back, a]);

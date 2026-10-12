@@ -1239,10 +1239,11 @@ proptest! {
         for (i, n) in NAMES.iter().enumerate() {
             prop_assert_eq!(declared.iter().filter(|d| d.as_str() == *n).count(), usize::from(e.hoisted[i]), "{} in {:?}", n, ss);
         }
-        // Resolve the locals; the final uses read the hoisted declarations.
-        let mut hir = out.hir.clone();
-        let _ = common::resolve_locals(&mut hir);
+        // Resolve through resolve-lang under PHP's policy; the final uses
+        // read the hoisted declarations.
+        let (hir, _) = common::resolve(out.hir.clone(), &names, resolve_lang::Policy::php());
         prop_assert_eq!(hir.validate(), Ok(()));
+        prop_assert!(common::hygienic(&hir));
         let finals = main_exprs(&Lowered::clone(&out));
         let finals = &finals[finals.len() - 4..];
         for (i, &fe) in finals.iter().enumerate() {
@@ -1254,7 +1255,8 @@ proptest! {
             } else if e.hoisted[i] {
                 prop_assert!(to_hoisted, "{} in {:?}", NAMES[i], ss);
             } else {
-                prop_assert!(res.is_unresolved(), "{} in {:?}", NAMES[i], ss);
+                // Not declared anywhere: the resolver reports it.
+                prop_assert!(matches!(res, hir_lang::Res::Err), "{} in {:?}", NAMES[i], ss);
             }
         }
         for i in 0..hir.count(IdKind::Path) {

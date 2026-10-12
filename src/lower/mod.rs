@@ -442,6 +442,10 @@ pub(crate) enum Build {
     Arch,
     /// An operator node lowered through an operator spec.
     Op(OpSpec),
+    /// A compound assignment through a non-OPS operator (`let_place`), and
+    /// the node count when its operands started (the charge for copying the
+    /// value into a template more than once).
+    Compound { spec: OpSpec, nodes_at: u64 },
     /// A template instantiation.
     Template {
         id: TemplateId,
@@ -548,6 +552,10 @@ pub(crate) struct Run<'a, 't, K> {
     pub(crate) pieces: Vec<Piece>,
     /// The expansion name of hoisting temporaries (`hoist`).
     pub(crate) hoist_sym: Symbol,
+    /// The expansion name of place-once compound assignments (`compound`).
+    pub(crate) compound_sym: Symbol,
+    /// The name of their place alias (`p`).
+    pub(crate) place_sym: Symbol,
 }
 
 /// Typed scratch lists for building HIR lists without allocating per node.
@@ -576,6 +584,12 @@ where
             .map_err(|_| LowerError::SymbolSpaceExhausted)?;
         let hoist_sym = names
             .try_intern("hoist")
+            .map_err(|_| LowerError::SymbolSpaceExhausted)?;
+        let compound_sym = names
+            .try_intern("compound")
+            .map_err(|_| LowerError::SymbolSpaceExhausted)?;
+        let place_sym = names
+            .try_intern("p")
             .map_err(|_| LowerError::SymbolSpaceExhausted)?;
         let mut syms = Vec::with_capacity(cfg.mapping.strings.len());
         for s in &cfg.mapping.strings {
@@ -625,6 +639,8 @@ where
             persist_marks: Vec::new(),
             pieces: Vec::new(),
             hoist_sym,
+            compound_sym,
+            place_sym,
         })
     }
 

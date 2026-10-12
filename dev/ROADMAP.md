@@ -124,19 +124,68 @@ Dependency wiring (decided here, recorded per the anti-deferral rule):
   intern-lang 1 wired; span-lang, macro-lang, diag-lang not wired;
   lang-forge 1.0.1 dev-dependency).
 
-## v0.4.0 - Resolver in the loop
-- [ ] `resolve-lang = "0.3"` as a dev-dependency once published; Mox tests and
-      the random-tree properties resolve through it (moved from v0.3.0, see
-      above).
+## v0.4.0 - Resolver in the loop, hir-lang 0.4, textual templates (DONE)
+The shortest path to the LexerSketch Demo (G3, "Mox programs print"):
+resolve-lang 0.4 and typeck-lang 0.3 are on hir-lang 0.4, so lower-lang had
+to move too, and Mox's `echo`, `print`, `&&`, `||`, and `++$i` were blocked on
+textual templates (LSF5105). Decision D26 pulled textual templates forward
+from v0.5.0.
+
+Delivered:
+- [x] `resolve-lang = "0.4"` as a dev-dependency (the item said 0.3, which
+      is built on hir-lang 0.3; 0.4 is the release on hir-lang 0.4, which
+      lower-lang now uses). The Mox tests (`tests/mox.rs`, `tests/textual.rs`,
+      `tests/hir_0_4.rs`), the PHP-scoping property (`tests/semantics.rs`),
+      and the random-tree properties (`tests/properties.rs`, under the lexical
+      or PHP resolution policy matching the lowering policy) resolve through
+      it; the toy `lookup_local` resolver remains only for the calc
+      evaluator.
+- [x] hir-lang 0.4: keyed `yield` (`Arch::Yield { key, value }`),
+      `Arch::YieldFrom`, `Arch::UnionTy` / `Arch::IntersectionTy` (LSF2
+      §15/§31), `pow` compounds, logical `not` vs `bit_not`, `shift =
+      saturate` through `LangPolicy::shift`; `TemplateBuilder::yield_kv`,
+      `yield_from`, `let_place` (`BinderKind::Place`), `union_ty`,
+      `intersection_ty`; the behaviour changes (union normalization, orphan
+      reporting, lenient repair) tested.
+- [x] Compound assignment with non-OPS operators (GAPS B2; LSF2 §15.6
+      `{ compound = { intrinsic | extern | template = … } }`):
+      `OpSpec::CompoundExtern`, `CompoundIntrinsic`, `CompoundTemplate`,
+      through `let_place`, so the place is evaluated once. The built-in
+      `post_increment` uses `let_place` too.
+- [x] **Textual templates** (D26; HIR spec §20 "Template additions"; LSF2
+      §15.7/§15.8): `Template::parse`, `MappingBuilder::parse_template`,
+      `SyntaxError`, `MAX_TEMPLATE_TEXT`, `MAX_TEMPLATE_DEPTH`. Every
+      `[semantics.templates]` text of `mox.lsf` parses and lowers; the inline
+      `[semantics.lower]` form works through `Template::hole_index`. The
+      `let_place` forms of the sketch's `pre_increment`, `pre_decrement`,
+      `post_increment`, `post_decrement` are in `tests/textual.rs` and
+      `examples/textual.rs` (the coordinator updates the sketch).
+- [x] Fixed: `Arch::RefAssign` was never finished (orphaned operands).
+- [x] Tests: parse-equals-builder differential property, hostile text,
+      depth cap on a small stack, every error kind; Mox end to end with
+      resolution; benchmarks `template_text/*`.
+
+Dependency wiring (decided here, recorded per the anti-deferral rule):
+- **hir-lang 0.4: wired** (was 0.3), shared with resolve-lang 0.4 and
+  typeck-lang 0.3 (one `hir_lang` in the tree).
+- **resolve-lang 0.4: dev-dependency** (registry). Not a runtime dependency:
+  resolution is the next stage (L4), and lower-lang's output must not depend
+  on it.
+- **No new runtime dependency.** The template text parser is our own
+  recursive descent over the text; hir-lang 0.5's textual parser does not
+  exist yet (D26), and lower-lang does not wait for it.
+- Unchanged: syntax-lang 1, intern-lang 1 wired; span-lang, macro-lang,
+  diag-lang not wired; lang-forge 1.0.1 dev-dependency.
 
 ## v0.5.0 - Implementation
 - [x] Quasi-quoted HIR templates with ${field} holes and hygienic expansion — delivered programmatically in v0.2.0.
 - [x] Budgets; diagnostics with spans; benchmarks — delivered in v0.2.0.
-- [ ] **Textual templates** in HIR's surface syntax (`while = "loop { if ${cond} {} else { break }; ${body} }"`):
-      a pure front end that parses the text into the existing `TemplateBuilder`
-      AST. **Moved here from the brief's v0.2.0 scope** because the textual
-      syntax (HIR spec §20) ships with hir-lang 0.5; the template AST was
-      designed so this needs no change to `Template`.
+- [x] **Textual templates** in HIR's surface syntax (`while = "loop { if ${cond} {} else { break }; ${body} }"`):
+      **delivered in v0.4.0 per decision D26** (lower-lang parses the
+      template subset of HIR spec §20 itself, ahead of hir-lang 0.5).
+      Remaining here: check this front end against hir-lang 0.5's textual
+      parser when it ships (same syntax, one spec), and fix whichever side
+      differs.
 - [ ] **LSF2 field labels from lang-forge 2.0**: an adapter implementing
       `Labeler` over lang-forge 2.0's label data (the `Pick::Label` path is
       implemented and tested with a hand-written labeler; lang-forge 1.x trees

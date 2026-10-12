@@ -809,6 +809,10 @@ where
                             let _ = self.t_binder(f, p as usize, &ctx, benv, BinderKind::Param);
                         }
                     }
+                    TNode::LetPlace { binder, .. } => {
+                        let _ =
+                            self.t_binder(f, usize::from(binder), &ctx, benv, BinderKind::Place);
+                    }
                     _ => {}
                 }
                 work.push(Work::Exit(n, c));
@@ -1015,23 +1019,63 @@ where
                 self.t_at(f, ctx.expn);
                 Val::Expr(self.ex(Expr::Break { label, value }))
             }
-            TNode::Return(v) | TNode::Yield(v) => {
+            TNode::Return(v) => {
                 let value = if v == NONE {
                     None
                 } else {
                     let x = next();
                     self.t_opt_expr(x)
                 };
-                if matches!(node, TNode::Yield(_)) {
-                    self.infer(hir_lang::Effects::YIELD);
-                }
                 self.t_at(f, ctx.expn);
-                let e = if matches!(node, TNode::Yield(_)) {
-                    Expr::Yield(value)
+                Val::Expr(self.ex(Expr::Return(value)))
+            }
+            TNode::Yield { key, value } => {
+                let key = if key == NONE {
+                    None
                 } else {
-                    Expr::Return(value)
+                    let x = next();
+                    self.t_opt_expr(x)
                 };
-                Val::Expr(self.ex(e))
+                let value = if value == NONE {
+                    None
+                } else {
+                    let x = next();
+                    self.t_opt_expr(x)
+                };
+                // A key without a value is malformed HIR; an absent optional
+                // value hole yields null under its key.
+                let value = match (key, value) {
+                    (Some(_), None) => {
+                        self.t_at(f, ctx.expn);
+                        Some(self.ex(Expr::Lit(Lit::Null)))
+                    }
+                    (_, v) => v,
+                };
+                self.infer(hir_lang::Effects::YIELD);
+                self.t_at(f, ctx.expn);
+                Val::Expr(self.ex(Expr::Yield { key, value }))
+            }
+            TNode::YieldFrom(_) => {
+                let x = next();
+                let source = self.t_expr(f, x, holes);
+                self.infer(hir_lang::Effects::YIELD);
+                self.t_at(f, ctx.expn);
+                Val::Expr(self.ex(Expr::YieldFrom(source)))
+            }
+            TNode::LetPlace { binder, .. } => {
+                let (p, b) = (next(), next());
+                let place = self.t_expr(f, p, holes);
+                let body = self.t_expr(f, b, holes);
+                let alias = benv.get(ctx.benv + usize::from(binder)).copied().flatten();
+                self.t_at(f, ctx.expn);
+                match alias {
+                    Some(binder) => Val::Expr(self.ex(Expr::LetPlace {
+                        binder,
+                        place,
+                        body,
+                    })),
+                    None => Val::Expr(self.ex(Expr::Err)),
+                }
             }
             TNode::Throw(_) | TNode::Await(_) | TNode::Spawn(_) => {
                 let x = next();
@@ -1162,6 +1206,22 @@ where
                 self.t_at(f, ctx.expn);
                 let elems = self.list(&list);
                 Val::Pat(self.pt(Pat::Tuple { elems, rest: None }))
+            }
+            TNode::TUnion(l) | TNode::TInter(l) => {
+                let mut list = Vec::new();
+                for _ in 0..l.1 {
+                    let v = next();
+                    if let Some(t) = self.t_opt_ty(v) {
+                        list.push(t);
+                    }
+                }
+                self.t_at(f, ctx.expn);
+                let members = self.list(&list);
+                Val::Ty(self.ty(if matches!(node, TNode::TUnion(_)) {
+                    Ty::Union(members)
+                } else {
+                    Ty::Intersection(members)
+                }))
             }
             TNode::PCtor { path, elems } => {
                 let mut list = Vec::new();
@@ -1396,8 +1456,15 @@ fn fill_children(t: &Template, node: &TNode, v: &mut Vec<u32>) {
             opt(step, v);
         }
         TNode::Break { value, .. } => opt(value, v),
-        TNode::Return(x) | TNode::Yield(x) => opt(x, v),
+        TNode::Return(x) => opt(x, v),
+        TNode::Yield { key, value } => {
+            opt(key, v);
+            opt(value, v);
+        }
+        TNode::LetPlace { place, body, .. } => v.extend([place, body]),
+        TNode::TUnion(l) | TNode::TInter(l) => v.extend_from_slice(t.list(l)),
         TNode::Throw(x)
+        | TNode::YieldFrom(x)
         | TNode::Await(x)
         | TNode::Spawn(x)
         | TNode::ExprStmt(x)

@@ -45,6 +45,24 @@
 //! # Ok::<(), lower_lang::MappingError>(())
 //! ```
 //!
+//! ## Templates as text
+//!
+//! Sugar is lowered through hygienic [templates](Template), written in HIR's
+//! template syntax and parsed once (never substituted):
+//!
+//! ```
+//! use lower_lang::{MappingBuilder, OpSpec};
+//!
+//! let mut b = MappingBuilder::<u8>::new();
+//! // PHP's `&&` (a bool), and `++$x` with the place evaluated once.
+//! let and = b.parse_template("bool_and", "if ${lhs} { not(not(${rhs})) } else { false }")?;
+//! let inc = b.parse_template("pre_increment", "let_place p = ${place} in p = add(p, 1)")?;
+//! b.binary_op(1, OpSpec::Template(and));
+//! b.prefix_op(2, OpSpec::Template(inc));
+//! assert!(b.build().is_ok());
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
 //! ## What lowering guarantees
 //!
 //! - **It never panics and always returns valid HIR** for any tree, including
@@ -90,6 +108,7 @@ mod pick;
 mod problem;
 mod template;
 pub mod templates;
+mod text;
 
 pub use arch::{Arch, RecordShape, TemplateUse};
 pub use hir_lang::Span;
@@ -106,6 +125,7 @@ pub use template::{
     TBinder, TExpr, TLabel, TLit, TPat, TStmt, TTy, Template, TemplateBuilder, TemplateError,
     TemplateId, TyHole,
 };
+pub use text::{MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_TEXT, SyntaxError};
 
 use intern_lang::Interner;
 use syntax_lang::{Node, TokenKind};

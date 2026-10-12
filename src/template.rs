@@ -1,10 +1,10 @@
 //! Lowering templates: small HIR-shaped ASTs with `${field}` holes.
 //!
-//! A template is what LexerSketch's `[semantics.lower]` section writes as
+//! A template is what LexerSketch's `[semantics.templates]` section writes as
 //! quasi-quoted HIR (`while = "loop { if ${cond} {} else { break }; ${body} }"`).
-//! In 0.2 templates are built programmatically with a [`TemplateBuilder`];
-//! the textual form arrives with hir-lang's textual syntax (0.5) as a pure
-//! front end that produces the same [`Template`] values.
+//! Templates are built programmatically with a [`TemplateBuilder`], or parsed
+//! from that text with [`Template::parse`] (the `text` module, a pure front
+//! end that produces the same [`Template`] values).
 //!
 //! Every instantiation records its own HIR expansion. Binders and labels a
 //! template introduces are created fresh per instantiation, carry that
@@ -337,7 +337,11 @@ pub(crate) enum TNode {
     Return(u32),
     Throw(u32),
     Await(u32),
-    Yield(u32),
+    Yield {
+        key: u32,
+        value: u32,
+    },
+    YieldFrom(u32),
     Spawn(u32),
     Tuple(TList),
     Array(TList),
@@ -349,6 +353,11 @@ pub(crate) enum TNode {
     Apply {
         template: u32,
         args: TList,
+    },
+    LetPlace {
+        binder: u16,
+        place: u32,
+        body: u32,
     },
     // ---- statements
     Let {
@@ -375,6 +384,8 @@ pub(crate) enum TNode {
     TNamed(u32),
     TInfer,
     TAny,
+    TUnion(TList),
+    TInter(TList),
 }
 
 /// A declared hole.
@@ -487,6 +498,89 @@ impl Template {
             .map(|h| (&*h.name, h.kind, h.optional))
     }
 
+    /// Parses a template written in HIR's textual template syntax (HIR spec
+    /// §20, LSF2 §15.8): the lazy path for `[semantics.templates]` and
+    /// inline `[semantics.lower]` texts.
+    ///
+    /// Holes are `${name}` (its kind — expression, pattern, type, or label —
+    /// follows from where it is written), `${name?}` (optional),
+    /// `${name?=<literal>}` (optional with a default), and `${...name}` (an
+    /// argument-list splice in a call, tuple, or array, or a statement
+    /// splice in a block). Holes are numbered in order of first appearance.
+    /// Names bound with `let`, `let_place`, a pattern, or a closure parameter
+    /// are template binders, fresh and hygienic per instantiation; labels
+    /// (`'l loop { … }`) likewise. Free names are written `global:a::b`,
+    /// host symbols `extern:mox.echo`. Operations are written by their OPS
+    /// name: `add(a, b)` takes the language's policies, `add<overflow=wrap>(a,
+    /// b)` exactly the ones written. `apply:<name>(…)` needs templates
+    /// registered before this one: use
+    /// [`MappingBuilder::parse_template`](crate::MappingBuilder::parse_template)
+    /// for it. The full grammar is in `docs/API.md`.
+    ///
+    /// # Errors
+    ///
+    /// [`TemplateError::Syntax`] with the byte range and a
+    /// [`SyntaxError`](crate::SyntaxError) for any text that is not a valid
+    /// template (never a panic, at any length or depth); `TooLarge` when the
+    /// result outgrows the template tables.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{HoleKind, Template};
+    ///
+    /// // PHP's `&&`, which returns a bool.
+    /// let and = Template::parse("bool_and", "if ${lhs} { not(not(${rhs})) } else { false }")?;
+    /// assert_eq!(and.hole(0), Some(("lhs", HoleKind::Expr, false)));
+    /// assert_eq!(and.hole(1), Some(("rhs", HoleKind::Expr, false)));
+    ///
+    /// // `++$i`, with the place evaluated once.
+    /// let inc = Template::parse("pre_increment", "let_place p = ${place} in p = add(p, 1)")?;
+    /// assert_eq!(inc.hole_count(), 1);
+    /// # Ok::<(), lower_lang::TemplateError>(())
+    /// ```
+    pub fn parse(name: &str, text: &str) -> Result<Self, TemplateError> {
+        crate::text::parse(name, text, None)
+    }
+
+    /// Records `Desugar` expansions instead of `Template` ones (LSF2's
+    /// `{ text = …, desugar = true }`), so tools can re-sugar the output.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::ExpnKind;
+    /// use lower_lang::Template;
+    ///
+    /// let t = Template::parse("echo", "extern:mox.echo(${...values})")?.desugar();
+    /// assert_eq!(t.expansion_kind(), ExpnKind::Desugar);
+    /// # Ok::<(), lower_lang::TemplateError>(())
+    /// ```
+    #[must_use]
+    pub fn desugar(mut self) -> Self {
+        self.kind = ExpnKind::Desugar;
+        self
+    }
+
+    /// The index of the hole named `name`, for binding node fields to holes
+    /// by name (LSF2: a hole missing from `holes` takes the node's field of
+    /// the same name).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::Template;
+    ///
+    /// let t = Template::parse("new_object", "extern:mox.new(${class}, ${...args})")?;
+    /// assert_eq!(t.hole_index("args"), Some(1));
+    /// assert_eq!(t.hole_index("nope"), None);
+    /// # Ok::<(), lower_lang::TemplateError>(())
+    /// ```
+    #[must_use]
+    pub fn hole_index(&self, name: &str) -> Option<usize> {
+        self.holes.iter().position(|h| &*h.name == name)
+    }
+
     pub(crate) fn node(&self, index: u32) -> Option<&TNode> {
         self.nodes.get(index as usize)
     }
@@ -553,6 +647,14 @@ pub enum TemplateError {
     /// The tree, counting shared sub-trees at every use, has more than
     /// [`MAX_TEMPLATE_SIZE`] nodes, or a table outgrew its index type.
     TooLarge,
+    /// A template text ([`Template::parse`]) is not valid template syntax:
+    /// what is wrong, and the byte range of the text it is about.
+    Syntax {
+        /// The offending bytes of the template text.
+        at: hir_lang::Span,
+        /// What is wrong there.
+        error: crate::SyntaxError,
+    },
 }
 
 impl fmt::Display for TemplateError {
@@ -571,6 +673,12 @@ impl fmt::Display for TemplateError {
             }
             Self::ForeignHandle => f.write_str("a handle from another template builder was used"),
             Self::TooLarge => f.write_str("the template is too large"),
+            Self::Syntax { at, error } => write!(
+                f,
+                "template text, bytes {}..{}: {error}",
+                at.start().to_usize(),
+                at.end().to_usize()
+            ),
         }
     }
 }
@@ -603,7 +711,7 @@ impl core::error::Error for TemplateError {}
 /// ```
 #[derive(Clone, Debug)]
 pub struct TemplateBuilder {
-    t: Template,
+    pub(crate) t: Template,
     overflow: bool,
 }
 
@@ -1331,7 +1439,46 @@ impl TemplateBuilder {
     /// assert!(t.finish(root).is_ok());
     /// ```
     pub fn yield_(&mut self, value: Option<TExpr>) -> TExpr {
-        TExpr(self.push(TNode::Yield(Self::opt(value))))
+        TExpr(self.push(TNode::Yield {
+            key: NONE,
+            value: Self::opt(value),
+        }))
+    }
+
+    /// `yield key => value`: a keyed yield (PHP and Mox generators), HIR
+    /// `Yield { key, value }`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut t = lower_lang::TemplateBuilder::new("pair");
+    /// let (k, v) = (t.expr_hole("key"), t.expr_hole("value"));
+    /// let (k, v) = (t.hole(k), t.hole(v));
+    /// let root = t.yield_kv(k, v);
+    /// assert!(t.finish(root).is_ok());
+    /// ```
+    pub fn yield_kv(&mut self, key: TExpr, value: TExpr) -> TExpr {
+        TExpr(self.push(TNode::Yield {
+            key: key.0,
+            value: value.0,
+        }))
+    }
+
+    /// `yield from source`: delegate to an inner generator or iterable; the
+    /// expression's value is the inner generator's return value (HIR
+    /// `YieldFrom`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut t = lower_lang::TemplateBuilder::new("delegate");
+    /// let h = t.expr_hole("from");
+    /// let source = t.hole(h);
+    /// let root = t.yield_from(source);
+    /// assert!(t.finish(root).is_ok());
+    /// ```
+    pub fn yield_from(&mut self, source: TExpr) -> TExpr {
+        TExpr(self.push(TNode::YieldFrom(source.0)))
     }
 
     /// `spawn callable`.
@@ -1440,6 +1587,41 @@ impl TemplateBuilder {
         TExpr(self.push(TNode::Apply {
             template: template.0,
             args: list,
+        }))
+    }
+
+    /// `let_place binder = place in body`: evaluates the operands of the place
+    /// expression `place` once and makes `binder` name that place in `body`,
+    /// for reads and writes (HIR `LetPlace`, binder kind `Place`). This is how
+    /// `++`, `--`, and compound assignments with a non-OPS operator evaluate
+    /// their place exactly once. The binder is bound here and must not be
+    /// bound anywhere else; HIR forbids capturing it in a closure.
+    ///
+    /// # Examples
+    ///
+    /// `++place` with the place evaluated once:
+    ///
+    /// ```
+    /// use hir_lang::OpKind;
+    /// use lower_lang::{TLit, TemplateBuilder};
+    ///
+    /// let mut t = TemplateBuilder::new("pre++");
+    /// let place = t.expr_hole("place");
+    /// let p = t.binder("p");
+    /// let target = t.hole(place);
+    /// let read = t.var(p);
+    /// let one = t.lit(TLit::Int(1));
+    /// let sum = t.op(OpKind::Add, &[read, one]);
+    /// let write = t.var(p);
+    /// let body = t.assign(write, sum);
+    /// let root = t.let_place(p, target, body);
+    /// assert!(t.finish(root).is_ok());
+    /// ```
+    pub fn let_place(&mut self, binder: TBinder, place: TExpr, body: TExpr) -> TExpr {
+        TExpr(self.push(TNode::LetPlace {
+            binder: binder.0,
+            place: place.0,
+            body: body.0,
         }))
     }
 
@@ -1655,6 +1837,49 @@ impl TemplateBuilder {
         TTy(self.push(TNode::TAny))
     }
 
+    /// A union type `A | B` (HIR `Ty::Union`). Members are kept in the order
+    /// given; hir-lang's `finish` puts them in canonical form (flattened,
+    /// sorted, repeats dropped, a single member collapsed).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::Prim;
+    ///
+    /// let mut t = lower_lang::TemplateBuilder::new("t");
+    /// let x = t.binder("x");
+    /// let p = t.bind(x);
+    /// let (int, string) = (t.prim(Prim::I64), t.prim(Prim::Str));
+    /// let ty = t.union_ty(&[int, string]);
+    /// let s = t.let_(p, Some(ty), None);
+    /// let root = t.block(&[s], None);
+    /// assert!(t.finish(root).is_ok());
+    /// ```
+    pub fn union_ty(&mut self, members: &[TTy]) -> TTy {
+        let members = self.list(members.iter().map(|m| m.0));
+        TTy(self.push(TNode::TUnion(members)))
+    }
+
+    /// An intersection type `A & B` (HIR `Ty::Intersection`), normalized like
+    /// [`union_ty`](Self::union_ty).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut t = lower_lang::TemplateBuilder::new("t");
+    /// let x = t.binder("x");
+    /// let p = t.bind(x);
+    /// let (a, b) = (t.named_ty("Countable"), t.named_ty("Traversable"));
+    /// let ty = t.intersection_ty(&[a, b]);
+    /// let s = t.let_(p, Some(ty), None);
+    /// let root = t.block(&[s], None);
+    /// assert!(t.finish(root).is_ok());
+    /// ```
+    pub fn intersection_ty(&mut self, members: &[TTy]) -> TTy {
+        let members = self.list(members.iter().map(|m| m.0));
+        TTy(self.push(TNode::TInter(members)))
+    }
+
     // ---------------------------------------------------------------- finish
 
     /// Checks the template rooted at `root` and returns it.
@@ -1791,10 +2016,20 @@ fn check(t: &Template) -> Result<Vec<u32>, TemplateError> {
             TNode::Return(v)
             | TNode::Throw(v)
             | TNode::Await(v)
-            | TNode::Yield(v)
+            | TNode::YieldFrom(v)
             | TNode::Spawn(v)
             | TNode::ExprStmt(v)
             | TNode::Defer(v) => stack.push((v, false)),
+            TNode::Yield { key, value } => stack.extend([(key, false), (value, false)]),
+            TNode::LetPlace {
+                binder,
+                place,
+                body,
+            } => {
+                bump(&mut c.binder_sites, usize::from(binder))?;
+                stack.extend([(place, false), (body, false)]);
+            }
+            TNode::TUnion(l) | TNode::TInter(l) => kids(l, false, &mut stack)?,
             TNode::Tuple(l) | TNode::Array(l) => kids(l, true, &mut stack)?,
             TNode::Closure { params, body, .. } => {
                 let (start, len) = (params.0 as usize, params.1 as usize);

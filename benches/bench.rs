@@ -9,6 +9,9 @@
 //! - `php/*`: Mox (PHP) code under `LangPolicy::php()`: functions with
 //!   `foreach` and `catch` whose variables are function-scoped, interpolated
 //!   strings, heredocs, and group `use` declarations.
+//! - `template_text/*`: parsing template texts (`Template::parse`): the Mox
+//!   sketch's templates registered into a mapping, and one text just under
+//!   the 1 MiB cap (12,878 statements, about 155,000 template nodes).
 //!
 //! Sizes are counted in syntax-tree *elements* (nodes plus tokens, trivia
 //! included) and printed when each benchmark starts.
@@ -276,5 +279,88 @@ fn php(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, calc, templates, deep, php);
+/// The template texts of the Mox sketch (`[semantics.templates]`).
+const MOX_TEMPLATES: [(&str, &str); 19] = [
+    ("bool_and", "if ${lhs} { not(not(${rhs})) } else { false }"),
+    ("bool_or", "if ${lhs} { true } else { not(not(${rhs})) }"),
+    ("pre_increment", "let_place p = ${place} in p = add(p, 1)"),
+    ("pre_decrement", "let_place p = ${place} in p = sub(p, 1)"),
+    (
+        "post_decrement",
+        "let_place p = ${place} in { let old = p; p = sub(old, 1); old }",
+    ),
+    ("new_object", "extern:mox.new(${class}, ${...args})"),
+    ("echo", "extern:mox.echo(${...values})"),
+    ("echo_text", "extern:mox.echo(${...text})"),
+    ("isset", "extern:mox.isset(${...args})"),
+    ("empty", "extern:mox.empty(${arg})"),
+    ("unset", "extern:mox.unset(${...places})"),
+    ("exit", "extern:mox.exit(${...value})"),
+    ("print", "extern:mox.print(${value})"),
+    ("include", "extern:mox.include(${path})"),
+    ("include_once", "extern:mox.include_once(${path})"),
+    ("require", "extern:mox.require(${path})"),
+    ("require_once", "extern:mox.require_once(${path})"),
+    ("spawn_task", "spawn(closure[by-value]() => ${operand})"),
+    (
+        "yield_from",
+        "{ let g = extern:mox.iter(${from});
+  loop {
+    match extern:mox.next(g) {
+      null => break extern:mox.gen_return(g),
+      (k, v) => { yield k => v; }
+    }
+  } }",
+    ),
+];
+
+/// One template text just under `MAX_TEMPLATE_TEXT`: a chain of `let`s,
+/// each reading the previous binder, with ops, holes, and a `match`.
+fn large_template() -> String {
+    let mut s = String::from("{ let v0 = ${x}; ");
+    let mut i = 1;
+    while s.len() < lower_lang::MAX_TEMPLATE_TEXT - 200 {
+        s.push_str(&format!(
+            "let v{i} = match add<overflow=wrap>(v{}, {i}) {{ 0 => ${{y}}, n => mul(n, 2) }}; ",
+            i - 1
+        ));
+        i += 1;
+    }
+    s.push_str(&format!("v{} }}", i - 1));
+    s
+}
+
+fn template_text(c: &mut Criterion) {
+    let mut g = c.benchmark_group("template_text");
+    let bytes: usize = MOX_TEMPLATES.iter().map(|(_, t)| t.len()).sum();
+    println!(
+        "template_text/mox: {} templates, {bytes} bytes",
+        MOX_TEMPLATES.len()
+    );
+    g.throughput(Throughput::Bytes(bytes as u64));
+    g.bench_function("mox", |b| {
+        b.iter(|| {
+            let mut m = lower_lang::MappingBuilder::<u8>::new();
+            for (name, text) in MOX_TEMPLATES {
+                let _ = m.parse_template(name, text).expect("parses");
+            }
+            m
+        });
+    });
+    let large = large_template();
+    let template = lower_lang::Template::parse("large", &large).expect("parses");
+    println!(
+        "template_text/large: {} bytes, {} holes",
+        large.len(),
+        template.hole_count()
+    );
+    g.sample_size(10);
+    g.throughput(Throughput::Bytes(large.len() as u64));
+    g.bench_function("large", |b| {
+        b.iter(|| lower_lang::Template::parse("large", &large).expect("parses"));
+    });
+    g.finish();
+}
+
+criterion_group!(benches, calc, templates, deep, php, template_text);
 criterion_main!(benches);

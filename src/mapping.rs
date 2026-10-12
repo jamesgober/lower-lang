@@ -8,6 +8,7 @@
 //! `Send` and `Sync` when `K` is, and lowers any number of trees.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -15,7 +16,8 @@ use hir_lang::{DivZero, FloatToInt, Op, OpKind, Overflow, PathRoot, Prim, Shift}
 
 use crate::arch::{Arch, TemplateUse};
 use crate::pick::{KindSets, Pick};
-use crate::template::{HoleKind, NONE, TArg, TNode, Template, TemplateId};
+use crate::template::{HoleKind, NONE, TArg, TNode, Template, TemplateError, TemplateId};
+use crate::text::{self, Registry, SyntaxError};
 
 /// What a token means when it is lowered on its own.
 ///
@@ -395,7 +397,8 @@ pub struct LangPolicy {
     pub overflow: Overflow,
     /// The division-by-zero policy.
     pub div_zero: DivZero,
-    /// The shift-amount policy.
+    /// The shift-amount policy (`Shift::Saturate` is PHP's rule: an amount
+    /// at or above the width gives `0`, or `-1` for `shr` of a negative).
     pub shift: Shift,
     /// The float-to-integer conversion policy.
     pub float_to_int: FloatToInt,
@@ -575,25 +578,49 @@ pub enum OpSpec {
     Extern(NameRef),
     /// A named backend intrinsic applied to the operands.
     Intrinsic(NameRef),
+    /// Compound assignment through a host function (`.=` as `mox.concat`):
+    /// `let_place p = target in p = f(p, value)`, so the place's operands are
+    /// evaluated once (HIR `LetPlace`).
+    CompoundExtern(NameRef),
+    /// Compound assignment through a named intrinsic (`**=` as `mox.pow`),
+    /// lowered like [`CompoundExtern`](Self::CompoundExtern).
+    CompoundIntrinsic(NameRef),
+    /// Compound assignment through a template with exactly two expression
+    /// holes, which receive the place alias and the value (`??=` through
+    /// [`coalesce`](crate::templates::coalesce)): `let_place p = target in p =
+    /// template(p, value)`.
+    CompoundTemplate(TemplateId),
 }
 
-/// Ops a compound assignment may use (HIR §8.2).
-const COMPOUND: [OpKind; 11] = [
-    OpKind::Add,
-    OpKind::Sub,
-    OpKind::Mul,
-    OpKind::Div,
-    OpKind::FloorDiv,
-    OpKind::Rem,
-    OpKind::FloorMod,
-    OpKind::And,
-    OpKind::Or,
-    OpKind::Xor,
-    OpKind::Shl,
-];
+impl OpSpec {
+    /// Whether this is a compound assignment through a non-OPS operator
+    /// (lowered through `let_place`).
+    pub(crate) const fn is_place_compound(self) -> bool {
+        matches!(
+            self,
+            Self::CompoundExtern(_) | Self::CompoundIntrinsic(_) | Self::CompoundTemplate(_)
+        )
+    }
+}
 
-pub(crate) fn compound_ok(kind: OpKind) -> bool {
-    COMPOUND.contains(&kind) || kind == OpKind::Shr
+/// Ops a compound assignment may use (HIR §8.2; `pow` since hir-lang 0.4).
+pub(crate) const fn compound_ok(kind: OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Add
+            | OpKind::Sub
+            | OpKind::Mul
+            | OpKind::Div
+            | OpKind::FloorDiv
+            | OpKind::Rem
+            | OpKind::FloorMod
+            | OpKind::And
+            | OpKind::Or
+            | OpKind::Xor
+            | OpKind::Shl
+            | OpKind::Shr
+            | OpKind::Pow
+    )
 }
 
 /// Operator positions, for the tables and errors.
@@ -1020,6 +1047,9 @@ impl<K: Ord> KindSets<K> for Mapping<K> {
 pub struct MappingBuilder<K> {
     m: Mapping<K>,
     rule_picks_error: Option<MappingError>,
+    /// Registered templates by name (the latest registration of a name), for
+    /// `apply:<name>` in template texts.
+    template_index: BTreeMap<Box<str>, u32>,
 }
 
 impl<K: Copy + Ord> Default for MappingBuilder<K> {
@@ -1066,6 +1096,7 @@ impl<K: Copy + Ord> MappingBuilder<K> {
                 policy: LangPolicy::default(),
             },
             rule_picks_error: None,
+            template_index: BTreeMap::new(),
         }
     }
 
@@ -1443,7 +1474,53 @@ impl<K: Copy + Ord> MappingBuilder<K> {
         let name_ref = self.string(&name);
         self.m.template_names.push(name_ref);
         self.m.templates.push(template);
+        let _ = self.template_index.insert(name, id);
         Ok(TemplateId(id))
+    }
+
+    /// Parses a template text ([`Template::parse`]) and registers it under
+    /// `name`: the path for LSF2's `[semantics.templates]`, in document
+    /// order. `apply:<name>(…)` in the text names a template registered
+    /// before this one — by its name, or, for the built-ins of
+    /// [`templates`](crate::templates), by its LSF2 name (`while`,
+    /// `do_while`, `c_for`, `for_each`, `logical_and`, `logical_or`,
+    /// `and_value`, `or_value`, `coalesce`, `try`, `post_increment`). When a
+    /// name is registered twice, the later registration answers.
+    ///
+    /// # Errors
+    ///
+    /// [`TemplateError::Syntax`] for text that is not a valid template,
+    /// including an `apply:` of an unknown template
+    /// ([`SyntaxError::UnknownTemplate`]) or with arguments that do not fit
+    /// its holes ([`SyntaxError::ApplyArgs`]); `TooLarge` when a table
+    /// outgrows its index type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{templates, MappingBuilder};
+    ///
+    /// let mut b = MappingBuilder::<u8>::new();
+    /// let _coalesce = b.template(templates::coalesce())?;
+    /// // `??` under another name, through the built-in.
+    /// let elvis = b.parse_template("elvis", "apply:coalesce(${lhs}, ${rhs})")?;
+    /// assert_eq!(elvis.index(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn parse_template(&mut self, name: &str, text: &str) -> Result<TemplateId, TemplateError> {
+        let registry = Registry {
+            templates: &self.m.templates,
+            by_name: &self.template_index,
+        };
+        let template = text::parse(name, text, Some(registry))?;
+        self.template(template).map_err(|e| match e {
+            MappingError::TooLarge => TemplateError::TooLarge,
+            // The parser checked every `apply` against this registry.
+            _ => TemplateError::Syntax {
+                at: hir_lang::Span::new(0, u32::try_from(text.len()).unwrap_or(u32::MAX)),
+                error: SyntaxError::ApplyArgs,
+            },
+        })
     }
 
     /// Nodes of `kind` lower through `template`, its holes filled from
@@ -1669,6 +1746,13 @@ fn op_fits(spec: OpSpec, fixity: Fixity, templates: &[Template]) -> bool {
             t.holes.len() == arity && t.holes.iter().all(|h| h.kind == HoleKind::Expr)
         }),
         OpSpec::Extern(_) | OpSpec::Intrinsic(_) => true,
+        OpSpec::CompoundExtern(_) | OpSpec::CompoundIntrinsic(_) => fixity == Fixity::Binary,
+        OpSpec::CompoundTemplate(id) => {
+            fixity == Fixity::Binary
+                && templates.get(id.index()).is_some_and(|t| {
+                    t.holes.len() == 2 && t.holes.iter().all(|h| h.kind == HoleKind::Expr)
+                })
+        }
     }
 }
 
@@ -1706,7 +1790,9 @@ fn missing_field<K>(arch: &Arch<K>) -> Option<&'static str> {
         | Arch::TupleTy { .. }
         | Arch::FnTy { .. }
         | Arch::ObjectTy { .. }
-        | Arch::ImplTy { .. } => None,
+        | Arch::ImplTy { .. }
+        | Arch::UnionTy { .. }
+        | Arch::IntersectionTy { .. } => None,
         Arch::Pass { inner } => need(&[("inner", inner.is_absent())]),
         Arch::Let { pat, .. } => need(&[("pat", pat.is_absent())]),
         Arch::ExprStmt { expr } => need(&[("expr", expr.is_absent())]),
@@ -1776,6 +1862,7 @@ fn missing_field<K>(arch: &Arch<K>) -> Option<&'static str> {
         Arch::VarVar { inner }
         | Arch::Deref { inner }
         | Arch::Await { inner }
+        | Arch::YieldFrom { inner }
         | Arch::Spawn { inner }
         | Arch::RefPat { inner }
         | Arch::PtrTy { inner }

@@ -49,6 +49,7 @@ where
         let (mut v, place) = match f.build {
             Build::Arch => self.finish_arch(&f),
             Build::Op(spec) => self.finish_op(&f, spec),
+            Build::Compound { spec, nodes_at } => self.finish_compound(&f, spec, nodes_at),
             Build::Template {
                 id,
                 label,
@@ -429,7 +430,12 @@ where
         let p = self.m.policy;
         let mut policy = Policy::NONE;
         if d.overflow.is_some() {
-            policy.overflow = Some(p.overflow);
+            // `int_cast` has a static result type, where HIR refuses `promote`
+            // (the same rule casts follow).
+            policy.overflow = Some(match (kind, p.overflow) {
+                (OpKind::IntCast(_), hir_lang::Overflow::Promote) => hir_lang::Overflow::Error,
+                (_, o) => o,
+            });
         }
         if d.div_zero.is_some() {
             policy.div_zero = Some(p.div_zero);
@@ -1202,8 +1208,18 @@ where
                 return self.done_expr(f, Expr::Await(e), false);
             }
             Arch::Yield { .. } => {
-                let value = self.opt_e(f, 0);
-                return self.done_expr(f, Expr::Yield(value), false);
+                let key = self.opt_e(f, 0);
+                let mut value = self.opt_e(f, 1);
+                if key.is_some() && value.is_none() {
+                    // HIR needs a value under a key: `yield k =>` yields null.
+                    self.at(span);
+                    value = Some(self.ex(Expr::Lit(hir_lang::Lit::Null)));
+                }
+                return self.done_expr(f, Expr::Yield { key, value }, false);
+            }
+            Arch::YieldFrom { .. } => {
+                let e = self.req_e(f, 0, "inner");
+                return self.done_expr(f, Expr::YieldFrom(e), false);
             }
             Arch::Spawn { .. } => {
                 let e = self.req_e(f, 0, "inner");
@@ -1436,6 +1452,19 @@ where
                 let bounds = self.bounds(f, 0);
                 self.at(span);
                 let t = self.ty(Ty::Impl(bounds));
+                self.adapt_ty(t, want, span)
+            }
+            Arch::UnionTy { .. } | Arch::IntersectionTy { .. } => {
+                let members = self.tys(f, 0);
+                self.at(span);
+                let t = if members.is_empty() {
+                    self.report(ProblemKind::MissingField { field: "members" }, span);
+                    self.ty(Ty::Err)
+                } else if matches!(f.arch, Arch::UnionTy { .. }) {
+                    self.ty(Ty::Union(members))
+                } else {
+                    self.ty(Ty::Intersection(members))
+                };
                 self.adapt_ty(t, want, span)
             }
             // Handled at entry; never opens a frame.
@@ -2029,11 +2058,131 @@ where
             OpSpec::Borrow(kind) => Expr::Borrow { kind, expr: a },
             OpSpec::Deref => Expr::Deref(a),
             OpSpec::Await => Expr::Await(a),
-            // Lowered at entry.
-            OpSpec::Identity | OpSpec::Template(_) => Expr::Err,
+            // Lowered at entry, or by `finish_compound`.
+            OpSpec::Identity
+            | OpSpec::Template(_)
+            | OpSpec::CompoundExtern(_)
+            | OpSpec::CompoundIntrinsic(_)
+            | OpSpec::CompoundTemplate(_) => Expr::Err,
         };
         let place = matches!(spec, OpSpec::Deref);
         self.done_expr(f, e, place)
+    }
+}
+
+impl<K> Run<'_, '_, K>
+where
+    K: Copy + Ord + TokenKind,
+{
+    /// `target op= value` with a non-OPS operator: `let_place p = target in
+    /// p = op(p, value)`. The alias `p` carries a fresh `Desugar` expansion's
+    /// mark (named `compound`), so it can neither capture nor be captured by
+    /// a user name, and the place's operands are evaluated exactly once.
+    fn finish_compound(&mut self, f: &Frame<K>, spec: OpSpec, nodes_at: u64) -> (Val, bool) {
+        let span = f.span;
+        let place = self.req_e(f, 0, "lhs");
+        let value = self.req_e(f, 1, "rhs");
+        let expn = self.b.expansion(hir_lang::Expansion {
+            kind: hir_lang::ExpnKind::Desugar,
+            name: self.compound_sym,
+            call_site: span,
+            parent: hir_lang::ExpnId::ROOT,
+            def_site: hir_lang::ExpnId::ROOT,
+        });
+        let origin = Origin::expanded(span, expn);
+        self.b.set_origin(origin);
+        let alias = self.binder(
+            Name::marked(self.place_sym, expn),
+            hir_lang::BinderKind::Place,
+            false,
+        );
+        self.b.set_origin(origin);
+        let read = self.b.use_binder(alias);
+        self.nodes += 2;
+        let combined = match spec {
+            OpSpec::CompoundExtern(name) => {
+                let sym = self.sym(name.0);
+                self.b.set_origin(origin);
+                let seg = Segment::new(Name::new(sym), origin);
+                let segs = self.list(&[seg]);
+                let mut p = Path::new(segs, Ns::Value);
+                p.res = Res::Extern(sym);
+                let path = self.path(p);
+                let callee = self.ex(Expr::Path(path));
+                let args = self.list(&[Arg::positional(read), Arg::positional(value)]);
+                self.ex(Expr::Call { callee, args })
+            }
+            OpSpec::CompoundIntrinsic(name) => {
+                let sym = self.sym(name.0);
+                self.b.set_origin(origin);
+                let args = self.list(&[read, value]);
+                self.ex(Expr::Intrinsic {
+                    kind: hir_lang::Intrinsic::Named(sym),
+                    generic_args: List::EMPTY,
+                    args,
+                })
+            }
+            OpSpec::CompoundTemplate(id) => self.compound_template(f, id, read, value, nodes_at),
+            _ => {
+                self.b.set_origin(origin);
+                self.ex(Expr::Err)
+            }
+        };
+        self.b.set_origin(origin);
+        let write = self.b.use_binder(alias);
+        self.nodes += 2;
+        let body = self.ex(Expr::Assign {
+            target: write,
+            op: None,
+            value: combined,
+        });
+        self.done_expr(
+            f,
+            Expr::LetPlace {
+                binder: alias,
+                place,
+                body,
+            },
+            false,
+        )
+    }
+
+    /// Instantiates a two-hole template with the place alias and the value as
+    /// its holes, through a scratch frame whose two fields are those values.
+    fn compound_template(
+        &mut self,
+        f: &Frame<K>,
+        id: TemplateId,
+        read: ExprId,
+        value: ExprId,
+        nodes_at: u64,
+    ) -> ExprId {
+        let mut g = *f;
+        g.vals_base = self.vals.len();
+        g.counts_base = self.counts.len();
+        g.nfields = 2;
+        g.want = Want::Expr;
+        g.flag = false;
+        g.build = Build::Template {
+            id,
+            label: None,
+            nodes_at,
+        };
+        for v in [read, value] {
+            self.vals.push(Slot {
+                v: Val::Expr(v),
+                span: f.span,
+                place: false,
+            });
+            self.counts.push(1);
+        }
+        let out = self.finish_template(&g, id, None, nodes_at);
+        self.vals.truncate(g.vals_base);
+        self.counts.truncate(g.counts_base);
+        match out {
+            Val::Expr(e) => e,
+            _ => self.err_expr(f.span),
+        }
     }
 }
 

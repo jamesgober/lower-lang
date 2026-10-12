@@ -233,3 +233,38 @@ pub fn error_exprs(hir: &Hir) -> usize {
     });
     n
 }
+
+/// Resolves `hir` through resolve-lang 0.4 under `policy` (the real resolver,
+/// in the loop since lower-lang 0.4): the resolved unit and the diagnostics.
+pub fn resolve(
+    hir: Hir,
+    names: &Interner,
+    policy: resolve_lang::Policy,
+) -> (Hir, Vec<resolve_lang::Diagnostic>) {
+    let res = resolve_lang::Resolver::new(policy)
+        .resolve(hir, names)
+        .expect("within the resolver's default budget");
+    let (units, diags, _) = res.into_parts();
+    let hir = units
+        .into_iter()
+        .next()
+        .expect("one unit in, one unit out")
+        .into_hir();
+    (hir, diags)
+}
+
+/// Every path resolved to a local names a binder with the path's own
+/// hygiene mark: no resolution crossed from user code into a template's
+/// names or back.
+pub fn hygienic(hir: &Hir) -> bool {
+    (0..hir.count(IdKind::Path)).all(|i| {
+        let path = hir.path(PathId::from_index(i).expect("in range"));
+        let Res::Local(b) = path.res else {
+            return true;
+        };
+        match (hir.list(path.segments).first(), hir.binder(b)) {
+            (Some(seg), Some(binder)) => binder.name.mark == seg.name.mark,
+            _ => false,
+        }
+    })
+}

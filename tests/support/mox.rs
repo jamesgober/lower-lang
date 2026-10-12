@@ -26,8 +26,8 @@
 
 use hir_lang::OpKind;
 use lower_lang::{
-    Arch, Escapes, Join, LangPolicy, Mapping, MappingBuilder, Modifier, OpSpec, Pick, TokenRole,
-    templates,
+    Arch, Escapes, Join, LangPolicy, Mapping, MappingBuilder, Modifier, NameRef, OpSpec, Pick,
+    TokenRole, templates,
 };
 use syntax_lang::{Builder, Node, Span, Token, TokenKind};
 
@@ -82,6 +82,15 @@ pub enum M {
     Attr,
     AttrArg,
     AttrGroup,
+    // nodes the textual-template tests add
+    Prefix,
+    Postfix,
+    Print,
+    YieldFrom,
+    YieldKv,
+    TypedParam,
+    UnionTy,
+    AssignOp,
     // tokens
     Var,
     Ident,
@@ -142,6 +151,14 @@ pub enum M {
     Protected,
     HashBracket,
     Colon,
+    OrOr,
+    PlusPlus,
+    MinusMinus,
+    DotEq,
+    CoalesceEq,
+    PowEq,
+    PrintKw,
+    FromKw,
     Space,
 }
 
@@ -201,10 +218,7 @@ impl W {
 /// Mox's semantics.
 pub fn mox_mapping() -> Mapping<M> {
     let mut b = MappingBuilder::new();
-    let foreach = b
-        .template(templates::for_each("mox.iter", "mox.next"))
-        .expect("registers");
-    let while_loop = b.template(templates::while_loop()).expect("registers");
+    let concat = structure(&mut b);
     let and = b.template(templates::logical_and()).expect("registers");
     let echo = {
         let mut t = lower_lang::TemplateBuilder::new("echo");
@@ -215,6 +229,23 @@ pub fn mox_mapping() -> Mapping<M> {
         b.template(t.finish(root).expect("valid"))
             .expect("registers")
     };
+    b.template_node(M::Echo, echo, &[Pick::AllAfter(M::EchoKw)]);
+    b.binary_op(M::Eq, OpSpec::Assign);
+    b.binary_op(M::Plus, OpSpec::Op(OpKind::Add));
+    b.binary_op(M::Lt, OpSpec::Op(OpKind::Lt));
+    b.binary_op(M::Dot, OpSpec::Extern(concat));
+    b.binary_op(M::AndAnd, OpSpec::Template(and));
+    b.build().expect("mox mapping is valid")
+}
+
+/// Everything in Mox's mapping but `echo` and the operator table (which
+/// `tests/textual.rs` replaces with textual templates). Returns the
+/// `mox.concat` name.
+pub fn structure(b: &mut MappingBuilder<M>) -> NameRef {
+    let foreach = b
+        .template(templates::for_each("mox.iter", "mox.next"))
+        .expect("registers");
+    let while_loop = b.template(templates::while_loop()).expect("registers");
     let concat = b.name("mox.concat");
 
     // PHP's lowering policy: promotion to float, implicit locals, place
@@ -348,6 +379,7 @@ pub fn mox_mapping() -> Mapping<M> {
     b.node(
         M::Yield,
         Arch::Yield {
+            key: Pick::Absent,
             value: Pick::AllAfter(M::YieldKw),
         },
     );
@@ -363,7 +395,6 @@ pub fn mox_mapping() -> Mapping<M> {
             Pick::Absent,
         ],
     );
-    b.template_node(M::Echo, echo, &[Pick::AllAfter(M::EchoKw)]);
     b.template_node(
         M::While,
         while_loop,
@@ -551,10 +582,5 @@ pub fn mox_mapping() -> Mapping<M> {
     b.modifier(M::Protected, Modifier::Protected);
     b.modifier(M::StaticKw, Modifier::Static);
 
-    b.binary_op(M::Eq, OpSpec::Assign);
-    b.binary_op(M::Plus, OpSpec::Op(OpKind::Add));
-    b.binary_op(M::Lt, OpSpec::Op(OpKind::Lt));
-    b.binary_op(M::Dot, OpSpec::Extern(concat));
-    b.binary_op(M::AndAnd, OpSpec::Template(and));
-    b.build().expect("mox mapping is valid")
+    concat
 }

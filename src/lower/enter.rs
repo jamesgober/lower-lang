@@ -590,6 +590,12 @@ where
                             ) => {
                                 f.build = Build::Op(spec);
                             }
+                            Some(spec) if spec.is_place_compound() => {
+                                f.build = Build::Compound {
+                                    spec,
+                                    nodes_at: self.nodes,
+                                };
+                            }
                             _ => {
                                 self.report(ProblemKind::UnknownOperator, t.span());
                                 let e = self.err_expr(span);
@@ -613,6 +619,9 @@ where
                 if !expr_ok {
                     return self.not_here(want, span);
                 }
+                // Finished like the `=&` operator spec (0.3 left the frame to
+                // the archetype finisher, which orphaned both operands).
+                f.build = Build::Op(OpSpec::RefAssign);
                 self.implicit_local(target);
                 self.plan(
                     f,
@@ -919,12 +928,19 @@ where
                 self.infer(Effects::ASYNC);
                 self.plan(f, &[(inner, Want::Expr, false)]);
             }
-            Arch::Yield { value } => {
+            Arch::Yield { key, value } => {
                 if !expr_ok {
                     return self.not_here(want, span);
                 }
                 self.infer(Effects::YIELD);
-                self.plan(f, &[(value, Want::Expr, false)]);
+                self.plan(f, &[(key, Want::Expr, false), (value, Want::Expr, false)]);
+            }
+            Arch::YieldFrom { inner } => {
+                if !expr_ok {
+                    return self.not_here(want, span);
+                }
+                self.infer(Effects::YIELD);
+                self.plan(f, &[(inner, Want::Expr, false)]);
             }
             Arch::Spawn { inner } => {
                 if !expr_ok {
@@ -1121,6 +1137,12 @@ where
                     return self.not_here(want, span);
                 }
                 self.plan(f, &[(bounds, Want::GArg, true)]);
+            }
+            Arch::UnionTy { members } | Arch::IntersectionTy { members } => {
+                if !ty_ok {
+                    return self.not_here(want, span);
+                }
+                self.plan(f, &[(members, Want::Ty, true)]);
             }
         }
     }
@@ -1332,6 +1354,18 @@ where
                     self.implicit_local(target);
                 }
                 f.build = Build::Op(spec);
+                self.plan_operands(f, operands);
+            }
+            OpSpec::CompoundExtern(_)
+            | OpSpec::CompoundIntrinsic(_)
+            | OpSpec::CompoundTemplate(_) => {
+                if let Some(&target) = operands.first() {
+                    self.implicit_local(target);
+                }
+                f.build = Build::Compound {
+                    spec,
+                    nodes_at: self.nodes,
+                };
                 self.plan_operands(f, operands);
             }
             _ => {

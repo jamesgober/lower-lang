@@ -29,6 +29,18 @@ fn lower(w: W) -> (Lowered, Interner, String) {
     (out, names, src)
 }
 
+/// How many paths resolve to a local binder.
+fn local_paths(hir: &Hir) -> usize {
+    (0..hir.count(IdKind::Path))
+        .filter(|&i| {
+            matches!(
+                hir.path(hir_lang::PathId::from_index(i).unwrap()).res,
+                Res::Local(_)
+            )
+        })
+        .count()
+}
+
 /// All expressions in walk order.
 fn exprs(hir: &Hir) -> Vec<Expr> {
     let mut v = Vec::new();
@@ -131,11 +143,15 @@ fn test_foreach_template_is_hygienic() {
     assert!(binders.iter().any(|b| b.name.mark.is_root()));
     assert!(binders.iter().any(|b| !b.name.mark.is_root()));
 
-    // Resolve user names: the user's `$it` in the loop body resolves to the
-    // user's binder, never to the template's.
-    let mut hir = hir;
-    let (resolved, _) = common::resolve_locals(&mut hir);
-    assert!(resolved >= 4);
+    // Resolve user names through resolve-lang under PHP's policy: the user's
+    // `$it` in the loop body resolves to the user's binder, never to the
+    // template's.
+    let (hir, diags) = common::resolve(hir, &names, resolve_lang::Policy::php());
+    assert_eq!(hir.validate(), Ok(()));
+    let messages: Vec<String> = diags.iter().map(|d| d.message(&names)).collect();
+    assert_eq!(messages, ["cannot find value `items` in this scope"]);
+    let resolved = local_paths(&hir);
+    assert!(resolved >= 4, "{resolved}");
     for i in 0..hir.count(IdKind::Path) {
         let p = *hir.path(hir_lang::PathId::from_index(i).unwrap());
         if let Res::Local(b) = p.res {
@@ -872,7 +888,7 @@ fn test_foreach_and_catch_variables_are_function_scoped() {
     w.close();
     let (out, names, _) = lower(w);
     assert!(out.problems.is_empty(), "{:?}", out.problems);
-    let mut hir = out.hir;
+    let hir = out.hir;
     // The function body starts with the hoisted `let k; let v; let e;`.
     let ItemKind::Module { items, .. } = hir.item(hir.root()).kind else {
         panic!()
@@ -900,8 +916,12 @@ fn test_foreach_and_catch_variables_are_function_scoped() {
     // After the loop and the handler, `$k`, `$v`, `$e` resolve to those
     // function-scoped binders (the pattern temporaries are marked, so no
     // name reaches them).
-    let (resolved, open) = common::resolve_locals(&mut hir);
-    assert_eq!(open, 0, "every local resolves");
+    let (hir, diags) = common::resolve(hir, &names, resolve_lang::Policy::php());
+    assert_eq!(hir.validate(), Ok(()));
+    // Every local resolves; only the class `Ex`, defined nowhere, does not.
+    let messages: Vec<String> = diags.iter().map(|d| d.message(&names)).collect();
+    assert!(messages.iter().all(|m| m.contains("`Ex`")), "{messages:?}");
+    let resolved = local_paths(&hir);
     assert!(resolved >= 7, "{resolved}");
     let p = hir_lang::print(&hir, &names);
     assert!(p.contains("(path k → local k%"), "{p}");
