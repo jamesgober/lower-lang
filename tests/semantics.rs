@@ -1051,8 +1051,9 @@ fn reference_number(text: &str, php: bool) -> NumOut {
     // Separators.
     let b = text.as_bytes();
     let (hex, start) = match (b.first(), b.get(1)) {
-        (Some(b'0'), Some(b'x')) => (true, 2),
-        (Some(b'0'), Some(b'o' | b'b')) => (false, 2),
+        // Radix prefixes are case-insensitive (`0X`, `0O`, `0B`), as in PHP.
+        (Some(b'0'), Some(b'x' | b'X')) => (true, 2),
+        (Some(b'0'), Some(b'o' | b'O' | b'b' | b'B')) => (false, 2),
         _ => (false, 0),
     };
     if php {
@@ -1075,9 +1076,9 @@ fn reference_number(text: &str, php: bool) -> NumOut {
     }
     let clean: String = text.chars().filter(|&c| c != '_').collect();
     let (mut radix, mut digits) = match clean.get(..2) {
-        Some("0x") => (16, &clean[2..]),
-        Some("0o") => (8, &clean[2..]),
-        Some("0b") => (2, &clean[2..]),
+        Some("0x" | "0X") => (16, &clean[2..]),
+        Some("0o" | "0O") => (8, &clean[2..]),
+        Some("0b" | "0B") => (2, &clean[2..]),
         _ => (10, &clean[..]),
     };
     // A decimal with `e`/`E` is a float literal: not generated here as such.
@@ -1426,5 +1427,27 @@ proptest! {
             })
             .collect();
         prop_assert_eq!(got, want);
+    }
+}
+
+/// Radix prefixes are case-insensitive under both tables (found by the
+/// integer-literal property on CI: `0B0` was decoded correctly, but the
+/// reference only knew lowercase prefixes).
+#[test]
+fn test_uppercase_radix_prefixes() {
+    for php in [false, true] {
+        let policy = if php {
+            LangPolicy::php()
+        } else {
+            LangPolicy::default()
+        };
+        for (text, want) in [("0B0", 0), ("0B101", 5), ("0X1F", 31), ("0O17", 15)] {
+            assert_eq!(reference_number(text, php), NumOut::Int(want), "{text}");
+            let (lits, _, _) = literals(&[(NUM, text)], policy);
+            assert!(
+                matches!(lits[0], Some(Lit::Int(i)) if i.value == want),
+                "{text} under php={php}"
+            );
+        }
     }
 }
