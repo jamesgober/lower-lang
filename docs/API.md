@@ -1,7 +1,7 @@
 # lower-lang &mdash; API Reference
 
 > Complete reference for every public item in `lower-lang`, with examples.
-> **Status: pre-1.0 (0.4.0, textual templates, hir-lang 0.4, resolver in the loop).** The surface is designed across the
+> **Status: pre-1.0 (0.4.1: implicit receivers, numeric break levels, per-archetype modifiers, conditional templates).** The surface is designed across the
 > 0.x series and frozen at 1.0, after the LexerSketch app has lowered at least
 > three target languages through it (decision D18). See
 > [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
@@ -28,6 +28,7 @@
   - [Operators by kind or by text](#operators-by-kind-or-by-text)
   - [Use trees, mixin rules, attributes](#use-trees-mixin-rules-attributes)
   - [Problems and half-typed code](#problems-and-half-typed-code)
+  - [PHP classes, loops, and spreads (0.4.1)](#php-classes-loops-and-spreads-041)
 - [`lower`](#lower)
 - [`Lowerer`](#lowerer)
 - [`Budget`](#budget)
@@ -41,7 +42,7 @@
 - [`Labeler`](#labeler)
 - [`TokenRole`](#tokenrole), [`Escapes`](#escapes), [`TypeName`](#typename)
 - [`Modifier`](#modifier)
-- [`LangPolicy`](#langpolicy), [`EffectMode`](#effectmode), [`IdentPatterns`](#identpatterns), [`PlaceArgs`](#placeargs)
+- [`LangPolicy`](#langpolicy), [`EffectMode`](#effectmode), [`IdentPatterns`](#identpatterns), [`PlaceArgs`](#placeargs), [`BreakLevels`](#breaklevels)
 - [`Literals`](#literals), [`Separators`](#separators), [`LegacyOctal`](#legacyoctal)
 - [`OpSpec`](#opspec), [`Fixity`](#fixity), [`NameRef`](#nameref), [`Join`](#join)
 - [`Template`](#template)
@@ -425,6 +426,18 @@ source each become an HIR error form plus a [`Problem`](#problem). hir-lang's
 outside a loop, a duplicate named argument, a misplaced `yield`) as
 [`ProblemKind::Hir`](#problemkind). The result is always a valid `Hir`.
 
+### PHP classes, loops, and spreads (0.4.1)
+
+- **Receivers.** [`LangPolicy::implicit_receiver`](#implicit-receiver) gives
+  methods PHP's `$this` as their HIR receiver parameter, and closures capture
+  it as PHP does.
+- **Numeric break levels.** [`BreakLevels::Numeric`](#breaklevels) lowers
+  `break 2` / `continue 2` to labelled jumps.
+- **Per-archetype modifiers.** [`modifier_in`](#per-archetype-modifiers) lets
+  `...` be a rest parameter and a spread argument.
+- **Conditional templates.** [`template_node_when`](#conditional-templates)
+  picks a template by a child (the `include` family).
+
 ## `lower`
 
 ```rust,ignore
@@ -559,6 +572,7 @@ pub struct Mapping<K> { /* private */ }   // Clone, Debug
 pub fn rule_for(&self, kind: &K) -> Option<&Arch<K>>
 pub fn role_for(&self, kind: &K) -> Option<TokenRole>
 pub fn modifier_for(&self, kind: &K) -> Option<Modifier>
+pub fn modifier_in(&self, kind: &K, archetype: &str) -> Option<Modifier>   // 0.4.1
 pub fn template(&self, id: TemplateId) -> Option<&Template>
 pub const fn policy(&self) -> &LangPolicy
 ```
@@ -566,7 +580,10 @@ pub const fn policy(&self) -> &LangPolicy
 A language's semantics, immutable once built; lowers any number of trees.
 `rule_for` returns the first rule registered for a node kind (conditional
 rules are tried in registration order during lowering); the other accessors
-read the token, modifier, template, and policy tables.
+read the token, modifier, template, and policy tables. `modifier_in` is the
+modifier a token sets inside one archetype (named by its
+[`Arch::lsf_name`](#arch)): the [per-archetype entry](#per-archetype-modifiers)
+if there is one, else the plain one.
 
 ```rust
 use lower_lang::{Arch, MappingBuilder, Modifier, TokenRole};
@@ -595,6 +612,7 @@ Every method records and returns `&mut Self` (chainable); `build` checks.
 | `node_when(kind, when, arch)` | ... when the pick `when` finds a child; otherwise the next rule for `kind` is tried (grammars that put alternatives in one rule) |
 | `token(kind, role)` | tokens of `kind` mean [`role`](#tokenrole) |
 | `modifier(kind, modifier)` | tokens of `kind` set a [`Modifier`](#modifier) on the construct they appear in |
+| `modifier_in(kind, archetype, modifier)` | 0.4.1: ... only inside archetype `archetype` (its LSF2 name, [`Arch::lsf_name`](#arch)), overriding the plain entry there ([per-archetype modifiers](#per-archetype-modifiers)) |
 | `root(kind, root)` | leading tokens of `kind` in a path set its `hir_lang::PathRoot` (`Super(1)` per `super`) |
 | `container(kind)` | list picks splice nodes of `kind` |
 | `skip(kind)` | list picks leave out tokens (or nodes) of `kind` |
@@ -608,14 +626,17 @@ Every method records and returns `&mut Self` (chainable); `build` checks.
 | `template(t) -> Result<TemplateId, MappingError>` | registers a [`Template`](#template); its `apply`s must name templates registered before it, with matching arguments |
 | `parse_template(name, text) -> Result<TemplateId, TemplateError>` | parses a [template text](#textual-templates) and registers it under `name`; `apply:` names templates registered before it |
 | `template_node(kind, id, holes)` | nodes of `kind` lower through template `id`, one pick per hole in hole order |
+| `template_node_when(kind, when, id, holes)` | 0.4.1: ... when the pick `when` finds a child; otherwise the next rule for `kind` is tried, as with `node_when` ([conditional templates](#conditional-templates)) |
 | `build() -> Result<Mapping<K>, MappingError>` | checks and sorts everything |
 
 **Errors (`build`):** a required field without a pick, a kind with two
 entries in a one-entry table (roles, modifiers, roots, each operator
 position, each operator text), a duplicate type name, an unknown template or
 a wrong number of template picks, an operator spec that cannot apply at its
-position, an empty operator text, or an interpolation [`Join`](#join)
-template of the wrong shape. See [`MappingError`](#mappingerror).
+position, an empty operator text, an interpolation [`Join`](#join)
+template of the wrong shape, a per-archetype modifier naming no archetype
+(or two entries for one kind and archetype), or an implicit receiver name
+the builder did not store. See [`MappingError`](#mappingerror).
 
 ```rust
 use hir_lang::OpKind;
@@ -651,6 +672,20 @@ pub const fn pass(n: u16) -> Self        // Pass { inner: Nth(n) }
 pub const fn binary() -> Self             // Binary { lhs: Nth(0), op: Nth(1), rhs: Nth(2) }
 pub const fn prefix() -> Self             // Unary { op: Nth(0), operand: Nth(1) }
 pub const fn name(&self) -> &'static str
+pub const fn lsf_name(&self) -> &'static str   // 0.4.1
+```
+
+`name` is how problems and docs spell the archetype ("expression
+statement"); `lsf_name` is its LSF2 name, the value of `arch = "…"` in
+`[semantics.bind]` (`expr_stmt`, `param`, `arg`, `map_entry`), and the key
+[`MappingBuilder::modifier_in`](#per-archetype-modifiers) takes. Archetypes
+LSF2 has no `arch` value for use the snake case of the variant
+(`mixin_rule`, `use_tree`, `attr_arg`, `template`).
+
+```rust
+use lower_lang::Arch;
+assert_eq!(Arch::<u8>::binary().lsf_name(), "binary");
+assert_eq!(Arch::<u8>::WildPat.lsf_name(), "wild_pat");
 ```
 
 The archetype catalogue. Fields marked *req* are required: a node that lacks
@@ -792,8 +827,8 @@ pub const fn template(&self) -> TemplateId
 ```
 
 The archetype a node gets from
-[`MappingBuilder::template_node`](#mappingbuilder): which template, and which
-picks fill its holes.
+[`MappingBuilder::template_node`](#mappingbuilder) (or `template_node_when`):
+which template, and which picks fill its holes.
 
 ```rust
 use lower_lang::{templates, Arch, MappingBuilder, Pick};
@@ -806,6 +841,38 @@ let Some(Arch::Template(used)) = m.rule_for(&1) else { unreachable!() };
 assert_eq!(used.template(), t);
 # Ok::<(), lower_lang::MappingError>(())
 ```
+
+### Conditional templates
+
+`template_node_when(kind, when, id, holes)` (0.4.1) is `node_when` for
+templates: LSF2's conditional alternatives `{ when = …, template = …, holes =
+… }` in `[semantics.bind]` (ISSUES P40). Rules for one kind are tried in
+registration order; the first whose `when` pick finds a child applies, and an
+unconditional rule (`node`, `template_node`) is the fallback. Mox's
+`include_expr` is one node kind for four keywords:
+
+```rust
+use lower_lang::{MappingBuilder, Pick};
+
+const INCLUDE_EXPR: u8 = 1;
+const INCLUDE_ONCE: u8 = 2;
+const REQUIRE: u8 = 3;
+const REQUIRE_ONCE: u8 = 4;
+let mut b = MappingBuilder::new();
+let path = [Pick::Back(0)];
+for (kw, name) in [(INCLUDE_ONCE, "include_once"), (REQUIRE, "require"), (REQUIRE_ONCE, "require_once")] {
+    let t = b.parse_template(name, &format!("extern:mox.{name}(${{path}})"))?;
+    b.template_node_when(INCLUDE_EXPR, Pick::Kind(kw), t, &path);
+}
+let include = b.parse_template("include", "extern:mox.include(${path})")?;
+b.template_node(INCLUDE_EXPR, include, &path);
+assert!(b.build().is_ok());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Hole counts are checked as for `template_node` (`MappingError::HoleCount`).
+A `{ hook = … }` alternative is LexerSketch's (lowering capabilities), not
+lower-lang's.
 
 ## `Pick`
 
@@ -913,6 +980,14 @@ assert_ne!(lower_lang::Escapes::None, lower_lang::Escapes::Quotes);
 `Prim(Prim)`, `Any`, `Never`, `SelfTy`, `Infer`: what a type keyword (role
 `Type`) or a registered type name means.
 
+Keyword type names (0.4.1): in a type (a path's segment, or a token lowered as
+a type), a keyword token with no role whose text is a registered
+`type_name` (PHP's `array`, `callable`) is that type, and so is a token with
+the literal role `Null`, `True`, or `False` (`null`, `false`, `true` as PHP 8
+types). Without a `type_name` entry they stay refused, as in 0.4.0. HIR has
+no `null`, `false`, `true`, `array`, or `callable` type term, so a mapping
+maps them to the nearest `TypeName` (Mox: `any`).
+
 ```rust
 use hir_lang::Prim;
 assert_eq!(lower_lang::TypeName::Prim(Prim::I32), lower_lang::TypeName::Prim(Prim::I32));
@@ -926,7 +1001,39 @@ assert_eq!(lower_lang::TypeName::Prim(Prim::I32), lower_lang::TypeName::Prim(Pri
 `Glob`, `Inclusive`, `Spread`, `SpreadNamed`, `Union`. Read from the direct
 significant children of the archetypes that consult them (and the tokens
 directly inside container children). Visibility is the most public modifier
-present, `Private` by default.
+present, `Private` by default; a member of a class, mixin, or interface
+without one takes [`LangPolicy::default_member_visibility`](#langpolicy)
+(PHP and Mox: `Public`).
+
+### Per-archetype modifiers
+
+One token kind can mean different modifiers in different constructs (LSF2
+`"..." = { param = "rest", arg = "spread" }`: PHP's `...` is a rest
+parameter in a parameter and a spread in an argument).
+`modifier_in(kind, archetype, modifier)` registers the meaning inside one
+archetype, named by its [`Arch::lsf_name`](#arch); inside that archetype it
+wins over the plain `modifier` entry, and elsewhere the plain entry (or
+nothing) applies. `Spread` on a `map_entry` (`[...$a, 1]`) is reported as
+`Unsupported` and the entry becomes an error: HIR's map and array literals
+have no spread entry, and dropping the marker would make `$a` one element.
+Parameter-list markers (a lone `NamedOnly` / `PositionalOnly` token) are read
+from the plain table only. An unknown archetype name is
+`MappingError::UnknownArchetype`; two entries for one kind and archetype are
+`DuplicateKind { table: "archetype modifier", .. }`.
+
+```rust
+use lower_lang::{MappingBuilder, Modifier};
+
+const DOTS: u8 = 7;
+let mut b = MappingBuilder::<u8>::new();
+b.modifier_in(DOTS, "param", Modifier::Rest)
+    .modifier_in(DOTS, "arg", Modifier::Spread);
+let m = b.build()?;
+assert_eq!(m.modifier_in(&DOTS, "param"), Some(Modifier::Rest));
+assert_eq!(m.modifier_in(&DOTS, "arg"), Some(Modifier::Spread));
+assert_eq!(m.modifier_for(&DOTS), None);
+# Ok::<(), lower_lang::MappingError>(())
+```
 
 ```rust
 let mut b = lower_lang::MappingBuilder::<u8>::new();
@@ -943,6 +1050,8 @@ pub struct LangPolicy {
     pub throws: EffectMode, pub yields: EffectMode, pub asyncs: EffectMode,
     pub implicit_locals: bool, pub ident_patterns: IdentPatterns, pub place_args: PlaceArgs,
     pub function_scoped_bindings: bool, pub literals: Literals,
+    pub implicit_receiver: Option<NameRef>, pub break_levels: BreakLevels,   // 0.4.1
+    pub default_member_visibility: Vis,                                      // 0.4.1
 }
 pub fn php() -> Self   // the PHP / Mox preset
 ```
@@ -956,6 +1065,9 @@ pub fn php() -> Self   // the PHP / Mox preset
 | `place_args` | `Marked` | which arguments are places ([`PlaceArgs`](#placeargs)) |
 | `function_scoped_bindings` | `false` | PHP: `for-each` pattern holes and `catch` names belong to the enclosing function ([Function-scoped bindings](#function-scoped-bindings-php)) |
 | `literals` | `Literals::default()` | how number literals are spelled ([`Literals`](#literals)) |
+| `implicit_receiver` | `None` | 0.4.1, LSF2 `implicit_receiver`: the name (from `MappingBuilder::name`) methods bind as their receiver ([Implicit receiver](#implicit-receiver)) |
+| `default_member_visibility` | `Private` | 0.4.1, LSF2 `default_visibility`: the `hir_lang::Vis` of a method, property, static, or constant of a class, mixin, or interface that has no visibility modifier (PHP and Mox: `Public`); declarations outside class bodies, `impl` members, and members with a keyword are unchanged |
+| `break_levels` | `Labels` | 0.4.1, LSF2 `break_levels`: a `break`/`continue` label is a name, or (PHP) a loop count ([`BreakLevels`](#breaklevels)) |
 
 A cast carries the language's `overflow` and `float_to_int` policies, except
 that `Promote` (valid only for dynamically typed results) becomes `Error`.
@@ -963,7 +1075,10 @@ that `Promote` (valid only for dynamically typed results) becomes `Error`.
 `LangPolicy::php()` is the PHP and Mox preset: `overflow = Promote`, `throws =
 Always`, `yields = Inferred`, `implicit_locals`, `place_args = Places`,
 `function_scoped_bindings`, and PHP's number spelling (`_` between digits,
-`0777` octal, no hex floats); every other field is the default.
+`0777` octal, no hex floats); every other field is the default. The preset is
+unchanged since 0.4.0: it leaves `implicit_receiver` unset (the name comes
+from a builder), `break_levels` at `Labels`, and `default_member_visibility`
+at `Private`, so PHP and Mox set all three.
 
 ```rust
 use hir_lang::Overflow;
@@ -976,6 +1091,76 @@ assert_eq!(p.overflow, Overflow::Wrap);
 let php = LangPolicy::php();
 assert!(php.function_scoped_bindings && php.implicit_locals);
 assert_eq!(php.literals.legacy_octal, LegacyOctal::Octal);
+```
+
+### Implicit receiver
+
+With `implicit_receiver = Some(name)` (PHP's `$this`: `name = b.name("this")`):
+
+- Every method of a class, mixin, or interface (a `Fn` lowered as a member
+  of a `Class` or `Interface`, through `Splice` members too) that has no
+  `Static` modifier and no explicit receiver parameter gets a first
+  parameter of kind `Receiver` binding `name`, with its origin at the
+  method's name. `static` methods, functions that are not members, and
+  `impl` members (which spell their receiver) get none; a parameter with the
+  `Receiver` modifier wins.
+- The receiver is an ordinary (unmarked) user name: the method body sees it,
+  an assignment to it never declares an implicit local, and template
+  binders, which carry their expansion's mark, never capture it or are
+  captured by it.
+- Closures follow PHP: a closure that sees only explicit captures
+  (`implicit: None`, `function () use (...)`) inside a method gets an extra
+  by-value capture of the receiver, first (unless it captures it
+  explicitly); one with implicit captures (`fn () =>`) reaches it through
+  them. A `static` closure has none, and neither has any closure nested in
+  one: reading the name there is a [`NoReceiver`](#problemkind) problem (the
+  closure would otherwise capture the method's receiver implicitly).
+- `MappingBuilder::build` refuses a `NameRef` it did not issue
+  (`MappingError::UnknownName`).
+
+bcgen-lang 0.4 compiles a method whose first parameter is a `Receiver` as an
+instance method; `tests/receivers.rs` runs constructors setting `$this->x`,
+methods reading it, `parent::__construct`, `new C(...)` and `new $name(...)`,
+static methods, mixin methods, closures over `$this`, and classes with no
+visibility keyword (under `default_member_visibility = Public`) end to end
+through resolve-lang 0.4.1, bcgen-lang 0.4, and bvm-lang 2.0.0-alpha.4.
+
+```rust
+use lower_lang::{LangPolicy, MappingBuilder};
+
+let mut b = MappingBuilder::<u8>::new();
+let mut mox = LangPolicy::php();
+mox.implicit_receiver = Some(b.name("this"));
+b.policy(mox);
+assert!(b.build()?.policy().implicit_receiver.is_some());
+# Ok::<(), lower_lang::MappingError>(())
+```
+
+### `BreakLevels`
+
+`#[non_exhaustive]`: `Labels` (default: a `break`/`continue` label is a
+name), `Numeric` (PHP: `break 2` / `continue 2` target the second enclosing
+loop of the same function).
+
+Under `Numeric`, the label pick of [`Arch::Break`](#arch) /
+[`Arch::Continue`](#arch) must find an integer literal (any radix, through
+`Pass` wrappers, so `break (2)` counts); the jump is lowered to a labelled
+HIR jump. The targeted loop keeps its own label or gets a hygienic one (a
+`Label` binder marked with its own `Desugar` expansion named `break_level`),
+made only when a jump needs it. An `Arch::Loop` and a template node whose
+template has a label hole (`while`, `do_while`, `c_for`, `for_each`) each
+count as one loop; functions and closures start a new count. A jump without
+a level stays a plain jump. A level of `0`, anything that is not an integer
+literal, or a level beyond the loops around the jump is a
+[`BreakLevel`](#problemkind) problem, and the jump becomes an error
+expression.
+
+```rust
+use lower_lang::{BreakLevels, LangPolicy};
+
+let mut php = LangPolicy::php();
+php.break_levels = BreakLevels::Numeric;
+assert_eq!(LangPolicy::default().break_levels, BreakLevels::Labels);
 ```
 
 ### `EffectMode`
@@ -1344,6 +1529,8 @@ assert_eq!(p.to_string(), "3..9: no enclosing loop or block has this label");
 | `AttributeArgument` | an attribute argument that is neither a literal nor a name; it is left out |
 | `MisplacedAttribute` | an attribute on a construct with no HIR node to carry it; it is dropped |
 | `Hir(HirError)` | a problem hir-lang's lenient validator repaired |
+| `BreakLevel { level, loops }` | 0.4.1: a numeric `break N` / `continue N` whose level is not a positive integer literal (`level` 0) or exceeds the `loops` around it in its function ([`BreakLevels`](#breaklevels)); the jump becomes an error expression |
+| `NoReceiver` | 0.4.1: the implicit receiver read inside a `static` closure (or a closure nested in one), where PHP has no `$this` ([Implicit receiver](#implicit-receiver)) |
 
 ## `HoistBlocker`
 
@@ -1400,8 +1587,11 @@ index }`, `DuplicateTypeName { index }`, `UnknownTemplate { template }`,
 `HoleCount { rule, expected, found }`, `ApplyArgs { template }`,
 `BadOperator { fixity, index }`, `TooLarge`, `BadJoin { rule }` (an
 interpolation [`Join`](#join) template with neither two expression holes nor
-one argument-list hole), `EmptyOperatorText { fixity, index }`. Indexes are
-registration positions.
+one argument-list hole), `EmptyOperatorText { fixity, index }`, and (0.4.1)
+`UnknownArchetype { index }` (a [per-archetype modifier](#per-archetype-modifiers)
+naming no archetype) and `UnknownName { index }` (an
+[implicit receiver](#implicit-receiver) `NameRef` the builder did not issue).
+Indexes are registration positions.
 
 ```rust
 use lower_lang::{Arch, MappingBuilder, MappingError, Pick};
@@ -1502,10 +1692,15 @@ assert_eq!((at.start().to_usize(), at.end().to_usize()), (0, 3));
 
 Pre-1.0. The 0.x series may break the API; each break is listed in the
 CHANGELOG. `Arch`, `Pick`, `TokenRole`, `Modifier`, `OpSpec`, `ProblemKind`,
-`Context`, `HoistBlocker`, `Join`, the error enums (`SyntaxError` included), `Budget`, `Lowered`,
+`Context`, `HoistBlocker`, `Join`, `BreakLevels`, the error enums (`SyntaxError` included), `Budget`, `Lowered`,
 `LangPolicy`, and `Literals` are
 `#[non_exhaustive]`, so new archetypes, picks, roles, and policies are
-additive. The exact wording of problem and error messages is not part of the
+additive. 0.4.1 is such a release: two `LangPolicy` fields, two
+`MappingBuilder` methods, `Mapping::modifier_in`, `Arch::lsf_name`, two
+`ProblemKind` and two `MappingError` variants, and `BreakLevels` (and a third
+`LangPolicy` field, `default_member_visibility`), with no
+change to existing signatures. `TypeName` is not `#[non_exhaustive]`, so new
+type terms wait for a minor release. The exact wording of problem and error messages is not part of the
 contract; match on variants. The template text syntax is HIR spec §20's
 template subset; when hir-lang 0.5 ships the full textual parser, this parser
 is checked against it (decision D26), and any difference is a bug in one of

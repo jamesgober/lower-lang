@@ -158,7 +158,7 @@ proptest! {
     /// templates stay hygienic (also after a resolver runs); and lowering is
     /// deterministic.
     #[test]
-    fn prop_random_trees_lower_soundly(t in tree_strategy(), policy in 0usize..3) {
+    fn prop_random_trees_lower_soundly(t in tree_strategy(), policy in 0usize..4) {
         let mapping = sink::sink(sink::policies()[policy]);
         let (tree, src) = write(&t);
         let mut names = Interner::new();
@@ -827,5 +827,74 @@ fn test_generator_reaches_the_0_3_paths() {
     assert!(
         attached > 3 && misplaced > 3 && imports > 3 && joins > 20 && texts > 10,
         "{attached} {misplaced} {hoisted} {imports} {rules} {joins} {texts}"
+    );
+}
+
+/// Guards the generator: random trees under the 0.4.1 policy (receiver,
+/// numeric break levels, per-archetype modifiers, conditional templates)
+/// must reach the new paths.
+#[test]
+fn test_generator_reaches_the_0_4_1_paths() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mapping = sink::sink(sink::policies()[3]);
+    let mut runner = TestRunner::deterministic();
+    let (
+        mut receivers,
+        mut captured,
+        mut levels,
+        mut labelled,
+        mut no_recv,
+        mut spread_entries,
+        mut conditional,
+    ) = (0, 0, 0, 0, 0, 0, 0);
+    for _ in 0..3000 {
+        let t = tree_strategy().new_tree(&mut runner).unwrap().current();
+        let (tree, src) = write(&t);
+        let mut names = Interner::new();
+        let out = lower_with(&mapping, &tree, &src, &mut names);
+        let hir = &out.hir;
+        let this = names.get("this");
+        hir_lang::walk(hir, |n| match n {
+            NodeRef::Param(p) => {
+                receivers += usize::from(hir.param(p).kind == hir_lang::ParamKind::Receiver);
+            }
+            NodeRef::Expr(e) => match hir.expr(e) {
+                Expr::Closure(c) => {
+                    captured += hir
+                        .list(c.captures)
+                        .iter()
+                        .filter(|cap| hir.binder(cap.binder).map(|b| b.name.sym) == this)
+                        .count();
+                }
+                Expr::Break { label: Some(l), .. } | Expr::Continue { label: Some(l) } => {
+                    let marked = hir.binder(*l).is_some_and(|b| !b.name.mark.is_root());
+                    labelled += usize::from(marked);
+                }
+                _ => {}
+            },
+            _ => {}
+        });
+        let q = names.get("??");
+        conditional += (1..=hir.count(IdKind::Expansion) as u32)
+            .filter_map(|i| hir.expansion(hir_lang::ExpnId::from_u32(i)))
+            .filter(|x| Some(x.name) == q)
+            .count();
+        for p in &out.problems {
+            match p.kind {
+                lower_lang::ProblemKind::BreakLevel { .. } => levels += 1,
+                lower_lang::ProblemKind::NoReceiver => no_recv += 1,
+                lower_lang::ProblemKind::Unsupported => spread_entries += 1,
+                _ => {}
+            }
+        }
+    }
+    // Random shapes reach the conditional template, spread entries, and
+    // bad levels often; receivers (a method inside a class) rarely, and
+    // well-formed jumps almost never, so `tests/receivers.rs` and
+    // `tests/break_levels.rs` drive those with dedicated generators.
+    assert!(
+        receivers > 0 && levels > 2 && spread_entries > 10 && conditional > 10,
+        "receivers {receivers}, captured {captured}, levels {levels}, labelled {labelled},          no_recv {no_recv}, spread {spread_entries}, conditional {conditional}"
     );
 }

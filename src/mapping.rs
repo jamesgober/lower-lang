@@ -12,7 +12,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
 
-use hir_lang::{DivZero, FloatToInt, Op, OpKind, Overflow, PathRoot, Prim, Shift};
+use hir_lang::{DivZero, FloatToInt, Op, OpKind, Overflow, PathRoot, Prim, Shift, Vis};
 
 use crate::arch::{Arch, TemplateUse};
 use crate::pick::{KindSets, Pick};
@@ -275,6 +275,36 @@ pub enum PlaceArgs {
     Places,
 }
 
+/// What the label of a `break` or `continue` is
+/// ([`LangPolicy::break_levels`]; LSF2 `break_levels`).
+///
+/// # Examples
+///
+/// ```
+/// use lower_lang::BreakLevels;
+///
+/// assert_eq!(BreakLevels::default(), BreakLevels::Labels);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum BreakLevels {
+    /// A name: `break 'outer` targets the loop or block labelled `'outer`
+    /// (Rust, Kraken, JavaScript).
+    #[default]
+    Labels,
+    /// A count: `break 2` / `continue 2` target the second enclosing loop of
+    /// the same function (PHP). The level is an integer literal from 1 up
+    /// to the number of loops around the jump; `0`, anything that is not an
+    /// integer literal, or a level beyond the enclosing loops is a
+    /// [`BreakLevel`](crate::ProblemKind::BreakLevel) problem. Lowered to a
+    /// labelled HIR `break`/`continue`: the targeted loop gets a hygienic
+    /// label (or keeps its own). An [`Arch::Loop`](crate::Arch::Loop) and a
+    /// template node whose template has a label hole (`while`, `do_while`,
+    /// `c_for`, `for_each`) each count as one loop; closures and functions
+    /// start a new count.
+    Numeric,
+}
+
 /// Where `_` may separate the digits of a number.
 ///
 /// # Examples
@@ -427,6 +457,33 @@ pub struct LangPolicy {
     pub function_scoped_bindings: bool,
     /// How number literals are spelled.
     pub literals: Literals,
+    /// The implicit receiver (LSF2 `implicit_receiver`; PHP's `$this`): a
+    /// name stored with [`MappingBuilder::name`]. When set, every method of
+    /// a class, mixin, or interface that is not `static` (no
+    /// [`Modifier::Static`]) and has no explicit receiver parameter gets a
+    /// first parameter of kind `Receiver` binding this name, visible to the
+    /// method's body (and to its parameter defaults) as an ordinary user
+    /// name; template binders carry their expansion's mark and never
+    /// capture it. A closure inside such a method captures it as PHP does:
+    /// one that only sees explicit captures (`implicit: None`, PHP's
+    /// `function () use (...)`) gets an extra by-value capture of the
+    /// receiver; one with implicit captures reaches it through them. A
+    /// `static` closure has no receiver, and neither does any closure nested
+    /// in one: reading the name there is a
+    /// [`NoReceiver`](crate::ProblemKind::NoReceiver) problem. Functions
+    /// that are not methods (and `impl` members, which spell their
+    /// receiver) are unchanged. A name [`build`](MappingBuilder::build)
+    /// cannot find is [`MappingError::UnknownName`].
+    pub implicit_receiver: Option<NameRef>,
+    /// What a `break`/`continue` label is: a name, or (PHP) a loop count.
+    pub break_levels: BreakLevels,
+    /// The visibility of a member of a class, mixin, or interface (a
+    /// method, a property, a static, a constant) that has no visibility
+    /// modifier (LSF2 `default_visibility`). `Private` by default, as in
+    /// 0.4.0; PHP and Mox members are `Public`. Declarations outside class
+    /// bodies, `impl` members, and members with a visibility keyword are
+    /// unchanged.
+    pub default_member_visibility: Vis,
 }
 
 impl LangPolicy {
@@ -436,6 +493,26 @@ impl LangPolicy {
     /// place, `foreach` and `catch` variables are function-scoped, and
     /// numbers use PHP's spelling (`_` between digits, `0777` octal, no hex
     /// floats).
+    ///
+    /// The preset is the 0.4.0 one: it leaves
+    /// [`implicit_receiver`](Self::implicit_receiver) unset (the name comes
+    /// from a [`MappingBuilder`]), [`break_levels`](Self::break_levels) at
+    /// `Labels`, and
+    /// [`default_member_visibility`](Self::default_member_visibility) at
+    /// `Private`. PHP and Mox set all three:
+    ///
+    /// ```
+    /// use hir_lang::Vis;
+    /// use lower_lang::{BreakLevels, LangPolicy, MappingBuilder};
+    ///
+    /// let mut b = MappingBuilder::<u8>::new();
+    /// let mut mox = LangPolicy::php();
+    /// mox.implicit_receiver = Some(b.name("this"));
+    /// mox.break_levels = BreakLevels::Numeric;
+    /// mox.default_member_visibility = Vis::Public;
+    /// b.policy(mox);
+    /// assert!(b.build().is_ok());
+    /// ```
     ///
     /// # Examples
     ///
@@ -484,6 +561,9 @@ impl Default for LangPolicy {
             place_args: PlaceArgs::Marked,
             function_scoped_bindings: false,
             literals: Literals::default(),
+            implicit_receiver: None,
+            break_levels: BreakLevels::Labels,
+            default_member_visibility: Vis::Private,
         }
     }
 }
@@ -741,6 +821,19 @@ pub enum MappingError {
         /// Its registration index in the text table.
         index: usize,
     },
+    /// A per-archetype modifier entry
+    /// ([`modifier_in`](MappingBuilder::modifier_in)) names no archetype
+    /// ([`Arch::lsf_name`] lists the names).
+    UnknownArchetype {
+        /// Its registration index among the per-archetype modifiers.
+        index: usize,
+    },
+    /// [`LangPolicy::implicit_receiver`] is a [`NameRef`] this builder did
+    /// not issue.
+    UnknownName {
+        /// The name's index.
+        index: usize,
+    },
 }
 
 impl fmt::Display for MappingError {
@@ -784,6 +877,14 @@ impl fmt::Display for MappingError {
             Self::EmptyOperatorText { fixity, index } => {
                 write!(f, "{fixity:?} operator text {index} is empty")
             }
+            Self::UnknownArchetype { index } => write!(
+                f,
+                "per-archetype modifier {index} names no archetype (expected an LSF2 `arch` name such as `param` or `arg`)"
+            ),
+            Self::UnknownName { index } => write!(
+                f,
+                "the implicit receiver is name {index}, which this mapping did not store"
+            ),
         }
     }
 }
@@ -829,6 +930,10 @@ pub struct Mapping<K> {
     pub(crate) by_kind: Vec<(K, u32)>,
     pub(crate) roles: Vec<(K, TokenRole)>,
     pub(crate) modifiers: Vec<(K, Modifier)>,
+    /// Modifiers that depend on the archetype they appear in (`...` is a
+    /// rest parameter in `param` and a spread in `arg`), sorted by kind;
+    /// they win over `modifiers` inside their archetype.
+    pub(crate) arch_modifiers: Vec<(K, &'static str, Modifier)>,
     pub(crate) roots: Vec<(K, PathRoot)>,
     pub(crate) containers: Vec<K>,
     pub(crate) skips: Vec<K>,
@@ -910,6 +1015,48 @@ impl<K: Copy + Ord> Mapping<K> {
     #[must_use]
     pub fn modifier_for(&self, kind: &K) -> Option<Modifier> {
         find(&self.modifiers, kind).copied()
+    }
+
+    /// The modifier token kind `kind` stands for inside archetype
+    /// `archetype` (its [`Arch::lsf_name`]): the
+    /// [per-archetype](MappingBuilder::modifier_in) entry, else the plain
+    /// one ([`modifier_for`](Self::modifier_for)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{MappingBuilder, Modifier};
+    ///
+    /// const DOTS: u8 = 7;
+    /// let mut b = MappingBuilder::<u8>::new();
+    /// b.modifier_in(DOTS, "param", Modifier::Rest)
+    ///     .modifier_in(DOTS, "arg", Modifier::Spread);
+    /// let m = b.build()?;
+    /// assert_eq!(m.modifier_in(&DOTS, "param"), Some(Modifier::Rest));
+    /// assert_eq!(m.modifier_in(&DOTS, "arg"), Some(Modifier::Spread));
+    /// assert_eq!(m.modifier_in(&DOTS, "map_entry"), None);
+    /// assert_eq!(m.modifier_for(&DOTS), None);
+    /// # Ok::<(), lower_lang::MappingError>(())
+    /// ```
+    #[must_use]
+    pub fn modifier_in(&self, kind: &K, archetype: &str) -> Option<Modifier> {
+        self.arch_modifier(kind, archetype)
+            .or_else(|| self.modifier_for(kind))
+    }
+
+    /// The per-archetype entry for `kind` in `archetype`, if any.
+    fn arch_modifier(&self, kind: &K, archetype: &str) -> Option<Modifier> {
+        if self.arch_modifiers.is_empty() {
+            return None;
+        }
+        let start = self.arch_modifiers.partition_point(|(k, _, _)| k < kind);
+        self.arch_modifiers
+            .get(start..)
+            .unwrap_or(&[])
+            .iter()
+            .take_while(|(k, _, _)| k == kind)
+            .find(|(_, a, _)| *a == archetype)
+            .map(|(_, _, m)| *m)
     }
 
     /// The registered template `id`.
@@ -1050,6 +1197,9 @@ pub struct MappingBuilder<K> {
     /// Registered templates by name (the latest registration of a name), for
     /// `apply:<name>` in template texts.
     template_index: BTreeMap<Box<str>, u32>,
+    /// Per-archetype modifiers as registered (archetype names checked by
+    /// `build`).
+    arch_modifiers: Vec<(K, Box<str>, Modifier)>,
 }
 
 impl<K: Copy + Ord> Default for MappingBuilder<K> {
@@ -1076,6 +1226,7 @@ impl<K: Copy + Ord> MappingBuilder<K> {
                 by_kind: Vec::new(),
                 roles: Vec::new(),
                 modifiers: Vec::new(),
+                arch_modifiers: Vec::new(),
                 roots: Vec::new(),
                 containers: Vec::new(),
                 skips: Vec::new(),
@@ -1097,6 +1248,7 @@ impl<K: Copy + Ord> MappingBuilder<K> {
             },
             rule_picks_error: None,
             template_index: BTreeMap::new(),
+            arch_modifiers: Vec::new(),
         }
     }
 
@@ -1161,6 +1313,35 @@ impl<K: Copy + Ord> MappingBuilder<K> {
     /// See [`Mapping::modifier_for`].
     pub fn modifier(&mut self, kind: K, modifier: Modifier) -> &mut Self {
         self.m.modifiers.push((kind, modifier));
+        self
+    }
+
+    /// Tokens of `kind` set `modifier` on constructs of archetype
+    /// `archetype` (its LSF2 name, [`Arch::lsf_name`]), overriding the
+    /// plain [`modifier`](Self::modifier) entry there: LSF2's per-archetype
+    /// value `"..." = { param = "rest", arg = "spread" }`, for a token whose
+    /// meaning depends on the construct (PHP's `...` is a rest parameter in a
+    /// parameter and a spread in an argument). Elsewhere the token sets the
+    /// plain entry, or nothing.
+    ///
+    /// `Spread` on a [`MapEntry`](Arch::MapEntry) (`[...$a, 1]`) is reported
+    /// as [`Unsupported`](crate::ProblemKind::Unsupported): HIR's map and
+    /// array literals have no spread entry. Parameter-list markers
+    /// (`NamedOnly`, `PositionalOnly` tokens standing alone) are read from
+    /// the plain table only.
+    ///
+    /// # Errors
+    ///
+    /// [`build`](Self::build) refuses an unknown archetype name
+    /// ([`MappingError::UnknownArchetype`]) and a kind given two entries for
+    /// one archetype ([`MappingError::DuplicateKind`], table `"archetype
+    /// modifier"`).
+    ///
+    /// # Examples
+    ///
+    /// See [`Mapping::modifier_in`].
+    pub fn modifier_in(&mut self, kind: K, archetype: &str, modifier: Modifier) -> &mut Self {
+        self.arch_modifiers.push((kind, archetype.into(), modifier));
         self
     }
 
@@ -1540,12 +1721,45 @@ impl<K: Copy + Ord> MappingBuilder<K> {
     /// # Ok::<(), lower_lang::MappingError>(())
     /// ```
     pub fn template_node(&mut self, kind: K, template: TemplateId, holes: &[Pick<K>]) -> &mut Self {
+        self.template_node_when(kind, Pick::Absent, template, holes)
+    }
+
+    /// Nodes of `kind` lower through `template` when `when` finds a child;
+    /// otherwise the next rule for `kind` (in registration order) is tried,
+    /// as with [`node_when`](Self::node_when). LSF2's conditional template
+    /// alternative `{ when = …, template = …, holes = … }` (ISSUES P40): PHP's
+    /// `include` / `include_once` / `require` / `require_once` are one node
+    /// kind told apart by their keyword.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{MappingBuilder, Pick};
+    ///
+    /// const INCLUDE_EXPR: u8 = 1;
+    /// const REQUIRE_KW: u8 = 2;
+    /// let mut b = MappingBuilder::new();
+    /// let require = b.parse_template("require", "extern:mox.require(${path})")?;
+    /// let include = b.parse_template("include", "extern:mox.include(${path})")?;
+    /// // `require EXPR` / `include EXPR`: the path is the last child.
+    /// b.template_node_when(INCLUDE_EXPR, Pick::Kind(REQUIRE_KW), require, &[Pick::Back(0)]);
+    /// b.template_node(INCLUDE_EXPR, include, &[Pick::Back(0)]);
+    /// assert!(b.build().is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn template_node_when(
+        &mut self,
+        kind: K,
+        when: Pick<K>,
+        template: TemplateId,
+        holes: &[Pick<K>],
+    ) -> &mut Self {
         let first = self.m.hole_picks.len();
         self.m.hole_picks.extend_from_slice(holes);
         match (u32::try_from(first), u32::try_from(holes.len())) {
             (Ok(first), Ok(len)) => self.add_rule(
                 kind,
-                Pick::Absent,
+                when,
                 Arch::Template(TemplateUse {
                     template,
                     first,
@@ -1567,8 +1781,9 @@ impl<K: Copy + Ord> MappingBuilder<K> {
     /// entries in a one-entry table (or a text with two entries in a text
     /// operator table), an unknown template or a wrong number of template
     /// picks, an operator spec that cannot apply where it is registered, an
-    /// empty operator text, or an interpolation join template of the wrong
-    /// shape.
+    /// empty operator text, an interpolation join template of the wrong
+    /// shape, a per-archetype modifier naming no archetype, or an implicit
+    /// receiver name this builder did not store.
     ///
     /// # Examples
     ///
@@ -1577,6 +1792,31 @@ impl<K: Copy + Ord> MappingBuilder<K> {
         if let Some(e) = self.rule_picks_error {
             return Err(e);
         }
+        if let Some(NameRef(i)) = self.m.policy.implicit_receiver {
+            if i as usize >= self.m.strings.len() {
+                return Err(MappingError::UnknownName { index: i as usize });
+            }
+        }
+        let mut arch_mods = Vec::with_capacity(self.arch_modifiers.len());
+        for (index, (kind, name, modifier)) in self.arch_modifiers.iter().enumerate() {
+            let name =
+                crate::arch::lsf_name_of(name).ok_or(MappingError::UnknownArchetype { index })?;
+            arch_mods.push((*kind, name, *modifier, index));
+        }
+        arch_mods.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)).then(a.3.cmp(&b.3)));
+        if let Some(w) = arch_mods
+            .windows(2)
+            .find(|w| w[0].0 == w[1].0 && w[0].1 == w[1].1)
+        {
+            return Err(MappingError::DuplicateKind {
+                table: "archetype modifier",
+                index: w[1].3,
+            });
+        }
+        self.m.arch_modifiers = arch_mods
+            .into_iter()
+            .map(|(k, a, m, _)| (k, a, m))
+            .collect();
         let m = &mut self.m;
         for (i, rule) in m.rules.iter().enumerate() {
             if let Some(field) = missing_field(&rule.arch) {
@@ -1895,8 +2135,13 @@ fn missing_field<K>(arch: &Arch<K>) -> Option<&'static str> {
     }
 }
 
-/// Every [`Modifier`] in bit order, for the scan of a node's children.
-pub(crate) fn modifier_bits<K: Ord>(map: &Mapping<K>, kind: &K) -> u32 {
+/// The modifier bit a token of `kind` sets inside archetype `arch` (its LSF2
+/// name; `None` when the mapping has no per-archetype entries), for the scan
+/// of a node's children.
+pub(crate) fn modifier_bits<K: Copy + Ord>(map: &Mapping<K>, kind: &K, arch: Option<&str>) -> u32 {
+    if let Some(m) = arch.and_then(|a| map.arch_modifier(kind, a)) {
+        return m.bit();
+    }
     find(&map.modifiers, kind).map_or(0, |m| m.bit())
 }
 

@@ -10,9 +10,10 @@ use hir_lang::{
 use intern_lang::Symbol;
 use syntax_lang::{Element, Node, TokenKind};
 
-use super::{Build, Frame, PatSite, Piece, Run, Slot, Task, Val, Want};
+use super::token::Decoded;
+use super::{Build, Frame, LoopEntry, PatSite, Piece, Recv, Run, Slot, Task, Val, Want};
 use crate::arch::Arch;
-use crate::mapping::{Escapes, Fixity, Modifier, OpSpec, TokenRole};
+use crate::mapping::{BreakLevels, Escapes, Fixity, Modifier, OpSpec, TokenRole};
 use crate::pick::{self, Pick};
 use crate::problem::{HoistBlocker, ProblemKind};
 use crate::template::{HoleKind, TemplateId};
@@ -119,7 +120,7 @@ where
             return self.wrap(f, node, Want::Stmt);
         }
         let mut f = self.frame(arch, want, span);
-        f.mods = self.mods();
+        f.mods = self.mods(&arch);
         let site = site_of(want);
         let expr_ok = want.takes_expr();
         let item_ok = matches!(want, Want::Root | Want::Stmt | Want::Member);
@@ -277,8 +278,19 @@ where
                 }
                 f.name = Some(self.req_name(name, span));
                 let declared = declared_effects(f.mods);
+                let method =
+                    want == Want::Member && !has(f.mods, Modifier::Static) && self.in_class_body();
                 self.push_fx(declared);
                 f.fx = true;
+                if let (true, Some(sym)) = (method, self.recv_sym) {
+                    // The implicit receiver: a parameter made when the
+                    // function finishes (unless it spells its own), and a
+                    // declared name, so an assignment to it never declares
+                    // an implicit local.
+                    f.flag = true;
+                    self.set_recv(Recv::Visible);
+                    self.declare_name(sym);
+                }
                 self.plan(
                     f,
                     &[
@@ -756,6 +768,14 @@ where
                 if want != Want::Entry {
                     return self.not_here(want, span);
                 }
+                if has(f.mods, Modifier::Spread) {
+                    // `[...$a, 1]`: HIR's map and array literals have no
+                    // spread entry, and dropping the marker would make `$a`
+                    // one element.
+                    self.report(ProblemKind::Unsupported, span);
+                    let v = self.error_val(want, span);
+                    return self.push(v, span);
+                }
                 self.plan(f, &[(key, Want::Expr, false), (value, Want::Expr, false)]);
             }
             Arch::RecordLit { path, fields, base } => {
@@ -864,13 +884,14 @@ where
                     return self.not_here(want, span);
                 }
                 f.binder = self.def_label(label);
+                self.push_loop(f.binder, span);
                 self.plan(f, &[(body, Want::Expr, false)]);
             }
             Arch::Break { label, value } => {
                 if !expr_ok {
                     return self.not_here(want, span);
                 }
-                if !self.jump_label(&mut f, label, want) {
+                if !self.jump_target(&mut f, label, want) {
                     return;
                 }
                 self.plan(f, &[(value, Want::Expr, false)]);
@@ -879,7 +900,7 @@ where
                 if !expr_ok {
                     return self.not_here(want, span);
                 }
-                if !self.jump_label(&mut f, label, want) {
+                if !self.jump_target(&mut f, label, want) {
                     return;
                 }
                 self.plan(f, &[]);
@@ -953,13 +974,30 @@ where
                 ret,
                 captures,
                 body,
-                ..
+                implicit,
             } => {
                 if !expr_ok {
                     return self.not_here(want, span);
                 }
+                let outer = self.recv_state();
                 self.push_fx(declared_effects(f.mods));
                 f.fx = true;
+                if let Some(sym) = self.recv_sym {
+                    // PHP: a closure made inside a method binds `$this`; a
+                    // `static` one does not, and nothing nested in it can.
+                    let state = match (outer, has(f.mods, Modifier::Static)) {
+                        (Recv::None, _) => Recv::None,
+                        (Recv::Visible, false) => Recv::Visible,
+                        _ => Recv::Hidden,
+                    };
+                    self.set_recv(state);
+                    if state == Recv::Visible && implicit.is_none() {
+                        // Only explicit captures are visible: the receiver
+                        // becomes one when the closure finishes.
+                        f.flag = true;
+                        self.declare_name(sym);
+                    }
+                }
                 self.plan(
                     f,
                     &[
@@ -1218,6 +1256,133 @@ where
 
     /// Resolves a jump's label into the frame. Returns false (after leaving an
     /// error value) when the label names no enclosing loop or block.
+    /// Whether a member being entered (or finished: its own frame is popped
+    /// by then) belongs to a class, mixin, or interface (not an `impl`,
+    /// whose methods spell their receiver). Members may sit in `Splice`
+    /// frames inside the body.
+    pub(crate) fn in_class_body(&self) -> bool {
+        for fr in self.frames.iter().rev() {
+            match fr.arch {
+                Arch::Splice { .. } => {}
+                Arch::Class { .. } | Arch::Interface { .. } => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Records a loop for numeric break levels (nothing under labels).
+    fn push_loop(&mut self, label: Option<hir_lang::BinderId>, span: Span) {
+        if self.m.policy.break_levels == BreakLevels::Numeric {
+            self.loops.push(LoopEntry { label, span });
+        }
+    }
+
+    /// The target of a `break`/`continue`, by the policy's kind of label.
+    fn jump_target(&mut self, f: &mut Frame<K>, label: Pick<K>, want: Want) -> bool {
+        if self.m.policy.break_levels == BreakLevels::Numeric {
+            self.numeric_jump(f, label, want)
+        } else {
+            self.jump_label(f, label, want)
+        }
+    }
+
+    /// `break N` / `continue N`: the N-th loop around the jump in its
+    /// function, given a label (made now if it has none). A bad level leaves
+    /// an error expression and returns `false`.
+    fn numeric_jump(&mut self, f: &mut Frame<K>, label: Pick<K>, want: Want) -> bool {
+        if label.is_absent() {
+            return true;
+        }
+        let Some(e) = self.pick1(label) else {
+            return true;
+        };
+        let level_span = e.span();
+        let level = self.level_of(e);
+        let base = self.fx.last().map_or(0, |x| x.loop_base);
+        let depth = self.loops.len().saturating_sub(base);
+        let target = usize::try_from(level)
+            .ok()
+            .filter(|&l| l >= 1 && l <= depth)
+            .and_then(|l| self.loops.len().checked_sub(l));
+        match target.and_then(|i| self.loop_label(i)) {
+            Some(b) => {
+                f.binder = Some(b);
+                true
+            }
+            None => {
+                self.report(
+                    ProblemKind::BreakLevel {
+                        level,
+                        loops: u32::try_from(depth).unwrap_or(u32::MAX),
+                    },
+                    level_span,
+                );
+                let e = self.err_expr(f.span);
+                let v = self.adapt_expr(e, false, want, f.span);
+                self.push(v, f.span);
+                false
+            }
+        }
+    }
+
+    /// The level a `break`/`continue` names: an integer literal (through
+    /// `Pass` wrappers, so `break (2)` counts); `0` for anything else.
+    fn level_of(&mut self, e: &'t Element<K>) -> u64 {
+        let mut cur = e;
+        loop {
+            match cur {
+                Element::Token(t) => {
+                    let role = match self.m.role_for(t.kind()) {
+                        None => TokenRole::Int,
+                        Some(r @ (TokenRole::Int | TokenRole::Number)) => r,
+                        Some(_) => return 0,
+                    };
+                    return match self.token_lit(role, t.span(), false) {
+                        Decoded::Lit(hir_lang::Lit::Int(i)) if !i.negative => i.value,
+                        // Beyond `u64`: certainly more loops than exist.
+                        Decoded::Lit(hir_lang::Lit::BigInt(_)) => u64::MAX,
+                        _ => 0,
+                    };
+                }
+                Element::Node(n) => {
+                    pick::collect_kids(n, self.labeler, self.m, &mut self.kids2, None);
+                    let inner = match self.m.rule_for(n.kind()) {
+                        Some(Arch::Pass { inner }) => pick::single(*inner, &self.kids2, self.m),
+                        _ => None,
+                    };
+                    match inner {
+                        Some(x) => cur = x,
+                        None => return 0,
+                    }
+                }
+            }
+        }
+    }
+
+    /// The label of loop `i` on the loop stack: its own, or a fresh hygienic
+    /// one (marked with its own `Desugar` expansion, so no user label can
+    /// name it), which the loop takes when it finishes.
+    fn loop_label(&mut self, i: usize) -> Option<hir_lang::BinderId> {
+        let entry = *self.loops.get(i)?;
+        if let Some(b) = entry.label {
+            return Some(b);
+        }
+        let expn = self.b.expansion(hir_lang::Expansion {
+            kind: hir_lang::ExpnKind::Desugar,
+            name: self.level_sym,
+            call_site: entry.span,
+            parent: hir_lang::ExpnId::ROOT,
+            def_site: hir_lang::ExpnId::ROOT,
+        });
+        self.at(entry.span);
+        let b = self.binder(Name::marked(self.level_sym, expn), BinderKind::Label, false);
+        if let Some(slot) = self.loops.get_mut(i) {
+            slot.label = Some(b);
+        }
+        Some(b)
+    }
+
     fn jump_label(&mut self, f: &mut Frame<K>, label: Pick<K>, want: Want) -> bool {
         if label.is_absent() {
             return true;
@@ -1403,6 +1568,7 @@ where
         let mut fields = core::mem::take(&mut self.tfields);
         fields.clear();
         let mut label = None;
+        let mut looping = false;
         // PHP scoping: a pattern hole's bindings belong to the function.
         let persist = self.m.policy.function_scoped_bindings;
         let pat_site = PatSite {
@@ -1425,9 +1591,14 @@ where
                     if label.is_none() {
                         label = self.def_label(p);
                     }
+                    looping = true;
                     fields.push((Pick::Absent, Want::Expr, false));
                 }
             }
+        }
+        if looping {
+            // A template with a label hole is a loop for numeric levels.
+            self.push_loop(label, span);
         }
         f.build = Build::Template {
             id,

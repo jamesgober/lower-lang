@@ -18,7 +18,7 @@ use lower_lang::{
 use super::writer::K;
 
 pub const TOKEN_KINDS: std::ops::RangeInclusive<u16> = 1..=49;
-pub const NODE_KINDS: std::ops::RangeInclusive<u16> = 100..=213;
+pub const NODE_KINDS: std::ops::RangeInclusive<u16> = 100..=216;
 pub const ERROR_KIND: K = K(197);
 pub const ROOT: K = K(100);
 
@@ -80,15 +80,26 @@ pub const TEXTS: &[&str] = &[
     ".=",
     "??=",
     "**=",
+    // 0.4.1: the implicit receiver, and a break level.
+    "$this",
+    "2",
 ];
 
 fn k(i: u16) -> K {
     K(i)
 }
 
-/// The sink mapping, with `policy` (the property tests try several).
-pub fn sink(policy: LangPolicy) -> Mapping<K> {
+/// The sink mapping, with `policy` (the property tests try several). A
+/// policy with numeric break levels is the 0.4.1 one: it also gets the
+/// implicit receiver `this`, per-archetype modifiers, a closure that sees
+/// only explicit captures (214), a numeric `break` (215), and a conditional
+/// template (216); under the other policies 214..=216 stay unmapped.
+pub fn sink(mut policy: LangPolicy) -> Mapping<K> {
     let mut b = MappingBuilder::new();
+    let v041 = policy.break_levels == lower_lang::BreakLevels::Numeric;
+    if v041 {
+        policy.implicit_receiver = Some(b.name("this"));
+    }
     b.policy(policy);
     // Tokens 1..=20 have roles; 21..=40 modifiers and operators; the rest
     // nothing.
@@ -625,6 +636,30 @@ pub fn sink(policy: LangPolicy) -> Mapping<K> {
     b.node_when(k(198), Pick::First(k(1)), Arch::ExprStmt { expr: n(0) });
     b.node(k(198), Arch::Pass { inner: back });
     // 199 and 200: unmapped.
+    if v041 {
+        b.modifier_in(k(25), "arg", Modifier::Spread)
+            .modifier_in(k(25), "map_entry", Modifier::Spread)
+            .modifier_in(k(31), "param", Modifier::Rest);
+        b.node(
+            k(214),
+            Arch::Closure {
+                params: Pick::Kind(k(102)),
+                ret: a,
+                captures: Pick::Kind(k(133)),
+                body: back,
+                implicit: None,
+            },
+        );
+        b.node(
+            k(215),
+            Arch::Break {
+                label: Pick::Kind(k(3)),
+                value: a,
+            },
+        );
+        b.template_node_when(k(216), Pick::First(k(1)), co, &[n(0), n(1)]);
+        b.template_node(k(216), w, &[n(0), back, a]);
+    }
     b.build().expect("the sink mapping is valid")
 }
 
@@ -640,5 +675,9 @@ pub fn policies() -> Vec<LangPolicy> {
     dynamic.ident_patterns = lower_lang::IdentPatterns::Bind;
     // PHP: function-scoped foreach/catch bindings, PHP number spelling.
     let php = LangPolicy::php();
-    vec![LangPolicy::default(), dynamic, php]
+    // 0.4.1: numeric break levels (and, in `sink`, the receiver).
+    let mut mox = LangPolicy::php();
+    mox.break_levels = lower_lang::BreakLevels::Numeric;
+    mox.default_member_visibility = hir_lang::Vis::Public;
+    vec![LangPolicy::default(), dynamic, php, mox]
 }

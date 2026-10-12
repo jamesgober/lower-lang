@@ -163,6 +163,33 @@ pub enum ProblemKind {
     MisplacedAttribute,
     /// A problem hir-lang's lenient validator found and repaired.
     Hir(HirError),
+    /// A numeric `break N` / `continue N`
+    /// ([`BreakLevels::Numeric`](crate::BreakLevels::Numeric)) whose level
+    /// is not a positive integer literal (`level` is `0`), or is larger than
+    /// the number of loops around it in its function (`loops`). The jump is
+    /// lowered as an error expression. PHP: "'break' operator accepts only
+    /// positive integers", "Cannot 'break' 2 levels".
+    ///
+    /// ```
+    /// use lower_lang::ProblemKind;
+    ///
+    /// let p = ProblemKind::BreakLevel { level: 3, loops: 2 };
+    /// assert_eq!(p.to_string(), "cannot break or continue 3 levels: only 2 loops enclose it");
+    /// ```
+    BreakLevel {
+        /// The level written (`0`: not a positive integer literal; levels
+        /// beyond `u64` saturate).
+        level: u64,
+        /// The loops around the jump in its function.
+        loops: u32,
+    },
+    /// The implicit receiver
+    /// ([`LangPolicy::implicit_receiver`](crate::LangPolicy::implicit_receiver),
+    /// PHP's `$this`) read inside a `static` closure, or a closure nested in
+    /// one, where PHP has no `$this` ("Using $this when not in object
+    /// context"). Lowered as written; the problem keeps the closure from
+    /// silently capturing the method's receiver.
+    NoReceiver,
 }
 
 /// Why a binding could not be hoisted to its function.
@@ -238,6 +265,24 @@ impl fmt::Display for ProblemKind {
                 f.write_str("nothing here can carry an attribute; it is dropped")
             }
             Self::Hir(e) => write!(f, "{e}"),
+            Self::BreakLevel { level: 0, .. } => {
+                f.write_str("a break or continue level must be a positive integer literal")
+            }
+            Self::BreakLevel { level, loops: 0 } => write!(
+                f,
+                "cannot break or continue {level} levels: no loop encloses it in this function"
+            ),
+            Self::BreakLevel { level, loops: 1 } => write!(
+                f,
+                "cannot break or continue {level} levels: only 1 loop encloses it"
+            ),
+            Self::BreakLevel { level, loops } => write!(
+                f,
+                "cannot break or continue {level} levels: only {loops} loops enclose it"
+            ),
+            Self::NoReceiver => f.write_str(
+                "the receiver is not available here: a static closure (and any closure inside one) has none",
+            ),
         }
     }
 }

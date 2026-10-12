@@ -54,6 +54,16 @@ where
                 _ => {}
             }
         }
+        // A keyword without a role (`array`, `callable`) whose text is a
+        // registered type name is that type in a type position.
+        let role = match role {
+            None if matches!(want, Want::Segment | Want::Ty | Want::GArg)
+                && self.keyword_type(span).is_some() =>
+            {
+                Some(TokenRole::Name)
+            }
+            r => r,
+        };
         let Some(role) = role else {
             self.report(ProblemKind::Unmapped, span);
             return self.error_val(want, span);
@@ -113,6 +123,15 @@ where
             Want::Segment => match role {
                 TokenRole::Name | TokenRole::Var { .. } => {
                     let (sym, _) = self.token_name(span, role);
+                    Val::Seg(Segment::new(Name::new(sym), Origin::new(span)))
+                }
+                // `null`, `true`, `false` are literals as values, but type
+                // names in a type (PHP 8 `?null`, `false`, `true` types)
+                // when the mapping registers their text as a type name.
+                TokenRole::Null | TokenRole::True | TokenRole::False
+                    if self.keyword_type(span).is_some() =>
+                {
+                    let (sym, _) = self.token_name(span, TokenRole::Name);
                     Val::Seg(Segment::new(Name::new(sym), Origin::new(span)))
                 }
                 _ => self.wrong_place(want, span),
@@ -232,6 +251,9 @@ where
         match role {
             TokenRole::Name | TokenRole::Var { .. } => {
                 let (sym, _) = self.token_name(span, role);
+                if Some(sym) == self.recv_sym && self.recv_state() == super::Recv::Hidden {
+                    self.report(ProblemKind::NoReceiver, span);
+                }
                 Some((self.name_expr(sym, span), true))
             }
             TokenRole::Wild
@@ -349,6 +371,11 @@ where
 
     /// An explicit capture of `sym`.
     pub(crate) fn capture(&mut self, sym: Symbol, span: Span, mode: hir_lang::CaptureMode) -> Val {
+        if Some(sym) == self.recv_sym {
+            if let Some(top) = self.fx.last_mut() {
+                top.recv_captured = true;
+            }
+        }
         let outer = self.name_path(sym, span, Ns::Value);
         let binder = self.binder(Name::new(sym), BinderKind::Capture, false);
         self.declare_name(sym);
@@ -359,11 +386,24 @@ where
         })
     }
 
+    /// The registered type name a literal keyword's text spells (`null`,
+    /// `false`, `true` in a type), if any.
+    fn keyword_type(&mut self, span: Span) -> Option<TypeName> {
+        if self.m.type_names.is_empty() {
+            return None;
+        }
+        let text = self.text_of(span);
+        self.m.type_name(text)
+    }
+
     /// A token as a type.
     fn token_ty(&mut self, role: TokenRole, span: Span) -> Option<TyId> {
         let ty = match role {
             TokenRole::Type(name) => type_of(name),
             TokenRole::Wild => Ty::Infer,
+            TokenRole::Null | TokenRole::True | TokenRole::False => {
+                type_of(self.keyword_type(span)?)
+            }
             TokenRole::Name => {
                 let text = self.text_of(span);
                 match self.m.type_name(text) {

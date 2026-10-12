@@ -13,6 +13,101 @@
 
 ---
 
+## [0.4.1] - 2026-10-12
+
+PHP classes and loops for the Mox demo: methods get the implicit receiver
+`$this` that bcgen-lang 0.4 compiles as an instance method's receiver, numeric
+`break N` / `continue N` lower to labelled jumps, one token can be a rest
+parameter and a spread argument, and a node can pick its template by a child
+(the `include` family). An additive patch: no existing signature changes, and
+every new behaviour is off until a mapping asks for it.
+
+### Added
+
+- **Implicit receiver** (LSF2 `implicit_receiver`; ISSUES P24):
+  `LangPolicy::implicit_receiver: Option<NameRef>`. Every non-`static` method
+  of a class, mixin, or interface without an explicit receiver gets a first
+  parameter of kind `Receiver` binding that name (an ordinary, unmarked user
+  name; its origin is the method's name). Closures inside methods follow PHP:
+  an explicit-captures closure (`implicit: None`) gets a by-value capture of
+  the receiver, unless it captures it itself; implicit-capture closures reach
+  it through their captures; a `static` closure (and anything nested in one)
+  has none, and reading the name there is the new `ProblemKind::NoReceiver`.
+  An assignment to the receiver never declares an implicit local.
+  `MappingBuilder::build` refuses a `NameRef` it did not issue
+  (`MappingError::UnknownName`).
+- **Default member visibility** (LSF2 `default_visibility`):
+  `LangPolicy::default_member_visibility: hir_lang::Vis`. A method,
+  property, static, or constant of a class, mixin, or interface without a
+  visibility modifier gets it (PHP and Mox: `Public`); the default `Private`
+  keeps 0.4.0's behaviour. Declarations outside class bodies, `impl` members,
+  and members with a keyword are unchanged.
+- **Numeric break levels** (LSF2 `break_levels = "numeric"`; ISSUES P24, P40):
+  `LangPolicy::break_levels` and the new `#[non_exhaustive]` enum
+  `BreakLevels { Labels, Numeric }`. Under `Numeric`, `break N` / `continue N`
+  target the N-th loop around the jump in its function (an `Arch::Loop`, or a
+  template node whose template has a label hole); the target keeps its own
+  label or gets a hygienic one (marked with a `Desugar` expansion named
+  `break_level`), made only when a jump needs it. Levels may be any integer
+  literal, through `Pass` wrappers (`break (2)`). A level of `0`, a
+  non-literal, or a level past the enclosing loops is the new
+  `ProblemKind::BreakLevel { level, loops }`, and the jump becomes an error
+  expression.
+- **Per-archetype modifiers** (LSF2 `"..." = { param = "rest", arg = "spread" }`;
+  ISSUES P24, P40): `MappingBuilder::modifier_in(kind, archetype, modifier)`
+  and `Mapping::modifier_in(kind, archetype)`. Inside the named archetype the
+  entry wins over the plain `modifier` one. `Spread` on a `map_entry`
+  (`[...$a]`) is reported as `Unsupported` (HIR has no spread entry) instead
+  of silently lowering `$a` as one element. Unknown archetype names are
+  `MappingError::UnknownArchetype`; two entries for one kind and archetype are
+  `MappingError::DuplicateKind { table: "archetype modifier", .. }`.
+- `Arch::lsf_name()`: an archetype's LSF2 name (`param`, `arg`, `map_entry`,
+  ...), the key `modifier_in` takes.
+- **Conditional templates** (LSF2 conditional `{ when = …, template = … }`
+  alternatives; ISSUES P40): `MappingBuilder::template_node_when(kind, when,
+  template, holes)`, tried in registration order with the other rules for the
+  kind. Mox's `include` / `include_once` / `require` / `require_once` lower
+  through it.
+- **Keyword type names** (LSF2 §31): in a type, a keyword token without a role
+  whose text is a registered `type_name` (`array`, `callable`), and a token
+  with the literal role `Null` / `True` / `False` whose text is one (`null`,
+  `false`, `true`), is that type. Without a `type_name` entry they are refused
+  as before.
+- Tests: `tests/receivers.rs` (constructors setting `$this->x`, methods
+  reading it, `parent::__construct`, static methods, mixin methods, and
+  closures over `$this`, `new C(...)` through the `new_object` template and
+  `new $name(...)`, and classes with no visibility keyword, run end to end
+  through resolve-lang 0.4.1, bcgen-lang 0.4, and bvm-lang 2.0.0-alpha.4;
+  default member visibility; capture rules; hygiene against a template
+  binding `this`; a reference-model property over random methods and
+  closures), `tests/break_levels.rs` (nested loops with `continue`,
+  `continue 2`, `break 2`, and `break 1` run end to end; a reference-model
+  property over random nests of loops, closures, and jumps; every bad level;
+  a 5,000-deep nest on a 256 KiB stack), `tests/modifiers_and_conditions.rs`
+  (rest and spread through one token, run end to end; the spread entry; the
+  include family; registration order; keyword type names). The random-tree
+  properties run under a fourth policy with every 0.4.1 feature on.
+- Dev-dependencies `bcgen-lang = "0.4"` and `bvm-lang = "=2.0.0-alpha.4"`
+  (registry), to run lowered Mox end to end.
+- Benchmark groups `oop/*` and `oop_off/*`.
+
+### Changed
+
+Behaviour a 0.4.0 mapping can notice (each was an error or a silent
+miscompile before; none changes a correct program's HIR):
+
+- A `map_entry` carrying `Modifier::Spread` (from a plain `modifier` entry
+  too) is now an `Unsupported` problem and an error entry. 0.4.0 dropped the
+  marker and lowered `[...$a]` as `[$a]`.
+- In a type position, a keyword token without a token role whose text is a
+  registered `type_name` is that type (0.4.0: an `Unmapped` problem), and a
+  `Null`/`True`/`False`-role token whose text is one is that type (0.4.0: a
+  `NotAllowedHere` problem).
+- The modifier scan reads per-archetype entries when a mapping has any;
+  mappings without them take the 0.4.0 path.
+
+---
+
 ## [0.4.0] - 2026-10-12
 
 Textual templates (decision D26), hir-lang 0.4, and the resolver in the loop:
@@ -310,7 +405,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/lower-lang/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lower-lang/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/jamesgober/lower-lang/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/jamesgober/lower-lang/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/lower-lang/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/lower-lang/compare/v0.1.0...v0.2.0

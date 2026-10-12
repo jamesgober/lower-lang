@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "lower-lang"
-version = "0.4.0"
+version = "0.4.1"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -74,6 +74,11 @@ lang-forge = "1.0.1"
 # Name resolution in the loop: the Mox tests and the random-tree properties
 # resolve lowered HIR through the real resolver (registry, never a path).
 resolve-lang = "0.4"
+# Classes, receivers, and numeric break levels end to end: the Mox tests
+# compile the resolved HIR to LSB and run it (registry, never a path; bcgen
+# 0.4 is the release that compiles classes, alpha.4 the VM it targets).
+bcgen-lang = "0.4"
+bvm-lang   = "=2.0.0-alpha.4"
 
 
 # BENCHMARKS

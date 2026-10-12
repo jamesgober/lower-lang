@@ -492,6 +492,9 @@ pub(crate) struct Frame<K> {
     /// An archetype-specific range: an interpolation's pieces, or the
     /// persistent-binding log mark of a hoisting `let`.
     pub(crate) aux: (u32, u32),
+    /// The loop stack's height when the frame opened; a loop frame's own
+    /// entry sits right there, and finishing the frame pops back to it.
+    pub(crate) loop_mark: usize,
 }
 
 /// A function, closure, or module body under construction: its effects and
@@ -502,6 +505,36 @@ pub(crate) struct Fx {
     pub(crate) inferred: Effects,
     pub(crate) hoist_base: usize,
     pub(crate) decl_base: usize,
+    /// Whether the implicit receiver is visible in this body.
+    pub(crate) recv: Recv,
+    /// Whether an explicit capture names the receiver (`use ($this)`), so
+    /// no implicit one is added.
+    pub(crate) recv_captured: bool,
+    /// Where this body's loops start on the loop stack (numeric break
+    /// levels never count loops outside their function).
+    pub(crate) loop_base: usize,
+}
+
+/// The implicit receiver's state in a function-like body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recv {
+    /// Not a method, nor a closure inside one: the receiver name is an
+    /// ordinary name (resolution decides).
+    None,
+    /// A method's body, or a closure that captures the receiver.
+    Visible,
+    /// A `static` closure inside a method (or a closure nested in one): the
+    /// name would otherwise reach the method's receiver through implicit
+    /// captures, so reading it is reported.
+    Hidden,
+}
+
+/// A loop the numeric break levels can target: its label, when it has one
+/// yet (its own, or one made on demand for a `break N`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LoopEntry {
+    pub(crate) label: Option<BinderId>,
+    pub(crate) span: Span,
 }
 
 /// One lowering run.
@@ -556,6 +589,14 @@ pub(crate) struct Run<'a, 't, K> {
     pub(crate) compound_sym: Symbol,
     /// The name of their place alias (`p`).
     pub(crate) place_sym: Symbol,
+    /// The implicit receiver's name, when the policy sets one.
+    pub(crate) recv_sym: Option<Symbol>,
+    /// The expansion name of labels made for numeric break levels
+    /// (`break_level`).
+    pub(crate) level_sym: Symbol,
+    /// The loops around the element being lowered (numeric break levels
+    /// only; empty otherwise).
+    pub(crate) loops: Vec<LoopEntry>,
 }
 
 /// Typed scratch lists for building HIR lists without allocating per node.
@@ -591,6 +632,9 @@ where
         let place_sym = names
             .try_intern("p")
             .map_err(|_| LowerError::SymbolSpaceExhausted)?;
+        let level_sym = names
+            .try_intern("break_level")
+            .map_err(|_| LowerError::SymbolSpaceExhausted)?;
         let mut syms = Vec::with_capacity(cfg.mapping.strings.len());
         for s in &cfg.mapping.strings {
             syms.push(
@@ -599,6 +643,12 @@ where
                     .map_err(|_| LowerError::SymbolSpaceExhausted)?,
             );
         }
+        // `build` checked the receiver's name is one of the strings.
+        let recv_sym = cfg
+            .mapping
+            .policy
+            .implicit_receiver
+            .and_then(|r| syms.get(r.0 as usize).copied());
         Ok(Self {
             m: cfg.mapping,
             src,
@@ -641,6 +691,9 @@ where
             hoist_sym,
             compound_sym,
             place_sym,
+            recv_sym,
+            level_sym,
+            loops: Vec::new(),
         })
     }
 
@@ -871,6 +924,7 @@ where
             path_root: hir_lang::PathRoot::Relative,
             attrs: (0, 0),
             aux: (0, 0),
+            loop_mark: self.loops.len(),
         }
     }
 
@@ -1191,18 +1245,23 @@ where
 
     /// The modifiers among the node's direct significant children (and the
     /// tokens directly inside container children).
-    pub(crate) fn mods(&self) -> u32 {
-        if self.m.modifiers.is_empty() {
+    pub(crate) fn mods(&self, arch: &Arch<K>) -> u32 {
+        if self.m.modifiers.is_empty() && self.m.arch_modifiers.is_empty() {
             return 0;
         }
+        // Per-archetype entries need the archetype's name; most mappings
+        // have none, and skip the lookup.
+        let name = (!self.m.arch_modifiers.is_empty()).then(|| arch.lsf_name());
         let mut bits = 0;
         for kid in &self.kids {
             match kid.elem {
-                Element::Token(t) => bits |= crate::mapping::modifier_bits(self.m, t.kind()),
+                Element::Token(t) => {
+                    bits |= crate::mapping::modifier_bits(self.m, t.kind(), name);
+                }
                 Element::Node(n) => {
                     if crate::pick::KindSets::is_container(self.m, n.kind()) {
                         for c in n.child_tokens() {
-                            bits |= crate::mapping::modifier_bits(self.m, c.kind());
+                            bits |= crate::mapping::modifier_bits(self.m, c.kind(), name);
                         }
                     }
                 }
@@ -1238,7 +1297,22 @@ where
             inferred: Effects::NONE,
             hoist_base: self.hoist.len(),
             decl_base: self.declared.len(),
+            recv: Recv::None,
+            recv_captured: false,
+            loop_base: self.loops.len(),
         });
+    }
+
+    /// The receiver state of the innermost function-like body.
+    pub(crate) fn recv_state(&self) -> Recv {
+        self.fx.last().map_or(Recv::None, |f| f.recv)
+    }
+
+    /// Sets the receiver state of the innermost function-like body.
+    pub(crate) fn set_recv(&mut self, recv: Recv) {
+        if let Some(top) = self.fx.last_mut() {
+            top.recv = recv;
+        }
     }
 
     /// Marks the innermost function-like frame as doing `effect`.

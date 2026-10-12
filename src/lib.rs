@@ -114,9 +114,9 @@ pub use arch::{Arch, RecordShape, TemplateUse};
 pub use hir_lang::Span;
 pub use lower::{Budget, Lowered, Lowerer};
 pub use mapping::{
-    EffectMode, Escapes, Fixity, IdentPatterns, Join, LangPolicy, LegacyOctal, Literals, Mapping,
-    MappingBuilder, MappingError, Modifier, NameRef, OpSpec, PlaceArgs, Separators, TokenRole,
-    TypeName,
+    BreakLevels, EffectMode, Escapes, Fixity, IdentPatterns, Join, LangPolicy, LegacyOctal,
+    Literals, Mapping, MappingBuilder, MappingError, Modifier, NameRef, OpSpec, PlaceArgs,
+    Separators, TokenRole, TypeName,
 };
 pub use pick::{Labeler, Pick};
 pub use problem::{Context, HoistBlocker, LowerError, Problem, ProblemKind};

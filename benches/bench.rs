@@ -9,6 +9,12 @@
 //! - `php/*`: Mox (PHP) code under `LangPolicy::php()`: functions with
 //!   `foreach` and `catch` whose variables are function-scoped, interpolated
 //!   strings, heredocs, and group `use` declarations.
+//! - `oop/*`: Mox classes under the 0.4.1 policies: methods with the
+//!   implicit receiver, closures capturing it, nested loops with `break 2`
+//!   and `continue 2`, rest parameters and spread arguments through one
+//!   per-archetype `...`, and the `include` family through conditional
+//!   templates; `oop_off/*` lowers the same trees with the receiver and
+//!   numeric levels switched off, so the difference is their cost.
 //! - `template_text/*`: parsing template texts (`Template::parse`): the Mox
 //!   sketch's templates registered into a mapping, and one text just under
 //!   the 1 MiB cap (12,878 statements, about 155,000 template nodes).
@@ -22,6 +28,8 @@
 mod common;
 #[path = "../tests/support/mox.rs"]
 mod mox;
+#[path = "../tests/support/mox_oop.rs"]
+mod oop;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use intern_lang::Interner;
@@ -362,5 +370,181 @@ fn template_text(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, calc, templates, deep, php, template_text);
+/// `n` classes like this (plus an `include_once` and a spread call each):
+///
+/// ```php
+/// class Ci {
+///     public $v;
+///     public function __construct($v) { $this->v = $v; }
+///     public function run(...$xs) {
+///         $t = 0;
+///         while ($t < 3) { $t = $t + 1; loop { if ($t < 2) { continue 2; } break 2; } }
+///         return function ($n) { return $this->v + $n; };
+///     }
+/// }
+/// include_once 'ci.mox';
+/// f(...$xs);
+/// ```
+fn oop_program(n: usize) -> (Node<oop::X>, String) {
+    use oop::{W, X};
+    let mut w = W::new();
+    w.open(X::File);
+    for i in 0..n {
+        w.class(&format!("C{i}"), None, |w| {
+            w.property("v", None);
+            w.function(X::Method, &[X::PublicKw], "__construct", &["v"], |w| {
+                w.stmt(|w| {
+                    w.assign(
+                        |w| {
+                            w.prop("this", "v");
+                        },
+                        |w| {
+                            w.var("v");
+                        },
+                    );
+                });
+            });
+            w.function(X::Method, &[X::PublicKw], "run", &["...xs"], |w| {
+                w.stmt(|w| {
+                    w.assign(
+                        |w| {
+                            w.var("t");
+                        },
+                        |w| {
+                            w.num(0);
+                        },
+                    );
+                });
+                w.while_(
+                    |w| {
+                        w.bin(
+                            X::Lt,
+                            |w| {
+                                w.var("t");
+                            },
+                            |w| {
+                                w.num(3);
+                            },
+                        );
+                    },
+                    |w| {
+                        w.stmt(|w| {
+                            w.assign(
+                                |w| {
+                                    w.var("t");
+                                },
+                                |w| {
+                                    w.bin(
+                                        X::Plus,
+                                        |w| {
+                                            w.var("t");
+                                        },
+                                        |w| {
+                                            w.num(1);
+                                        },
+                                    );
+                                },
+                            );
+                        });
+                        w.open(X::Loop).t(X::LoopKw, "loop");
+                        w.block(|w| {
+                            w.if_(
+                                |w| {
+                                    w.bin(
+                                        X::Lt,
+                                        |w| {
+                                            w.var("t");
+                                        },
+                                        |w| {
+                                            w.num(2);
+                                        },
+                                    );
+                                },
+                                |w| {
+                                    w.jump(X::ContinueKw, Some("2"));
+                                },
+                            );
+                            w.jump(X::BreakKw, Some("2"));
+                        });
+                        w.close();
+                    },
+                );
+                w.ret(|w| {
+                    w.closure(false, &["n"], &[], |w| {
+                        w.ret(|w| {
+                            w.bin(
+                                X::Plus,
+                                |w| {
+                                    w.prop("this", "v");
+                                },
+                                |w| {
+                                    w.var("n");
+                                },
+                            );
+                        });
+                    });
+                });
+            });
+        });
+        w.stmt(|w| {
+            w.open(X::Include)
+                .t(X::IncludeOnceKw, "include_once")
+                .t(X::Str, "'ci.mox'")
+                .close();
+        });
+        w.stmt(|w| {
+            w.call(
+                |w| {
+                    w.t(X::Ident, "f");
+                },
+                1,
+                &[true],
+                |w, _| {
+                    w.var("xs");
+                },
+            );
+        });
+    }
+    w.close();
+    w.finish()
+}
+
+fn oop_bench(c: &mut Criterion) {
+    for (group, mapping) in [
+        ("oop", oop::mapping()),
+        ("oop_off", oop::mapping_with(false, false)),
+    ] {
+        let mut g = c.benchmark_group(group);
+        g.sample_size(10);
+        for (label, n) in [("100k", 520), ("1m", 5_200)] {
+            let (tree, src) = oop_program(n);
+            let elems = elements(&tree);
+            println!(
+                "{group}/{label}: {elems} syntax-tree elements, {} bytes",
+                src.len()
+            );
+            g.throughput(Throughput::Elements(elems));
+            g.bench_with_input(BenchmarkId::from_parameter(label), &tree, |b, tree| {
+                b.iter(|| {
+                    let mut names = Interner::new();
+                    let out =
+                        lower_lang::lower(tree, &src, &mapping, &mut names).expect("within budget");
+                    assert!(out.problems.is_empty(), "{:?}", &out.problems[..1]);
+                    out.hir
+                });
+            });
+        }
+        g.finish();
+    }
+}
+
+criterion_group!(
+    benches,
+    calc,
+    templates,
+    deep,
+    php,
+    template_text,
+    oop_bench
+);
 criterion_main!(benches);

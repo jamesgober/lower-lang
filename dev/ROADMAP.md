@@ -177,6 +177,81 @@ Dependency wiring (decided here, recorded per the anti-deferral rule):
 - Unchanged: syntax-lang 1, intern-lang 1 wired; span-lang, macro-lang,
   diag-lang not wired; lang-forge 1.0.1 dev-dependency.
 
+## v0.4.1 - Receivers, break levels, per-archetype modifiers, conditional templates (DONE)
+An additive patch for the next Mox release: bcgen-lang 0.4 compiles classes,
+but Mox methods could not run because lower-lang emitted no receiver
+parameter (LSF2 `implicit_receiver` was pending). This patch closes that and
+the other pending LSF2 items the release needs (ISSUES P24 rows, P40). No
+existing signature changes; every new behaviour is off until a mapping asks
+for it.
+
+Delivered:
+- [x] **`implicit_receiver`** (LSF2 §15.2): `LangPolicy::implicit_receiver:
+      Option<NameRef>`. Non-`static` methods of classes, mixins, and
+      interfaces get a first `Receiver` parameter binding the name (unmarked,
+      so user code sees it and template binders never capture it); explicit
+      receivers win; `impl` members and non-member functions are unchanged.
+      Closures follow PHP: explicit-capture closures get a by-value capture
+      of the receiver (unless spelled), implicit-capture closures reach it,
+      `static` closures and anything nested in them have none (reading it
+      there is `ProblemKind::NoReceiver`). `MappingError::UnknownName` for a
+      foreign `NameRef`. End to end through resolve-lang 0.4, bcgen-lang 0.4,
+      and bvm-lang 2.0.0-alpha.4: constructor setting `$this->x`, a method
+      reading it, `parent::__construct`, static methods (`self::`, `K::`),
+      mixin methods, closures and arrow functions over `$this`.
+- [x] **`break_levels`** (LSF2 §15.2): `LangPolicy::break_levels`,
+      `BreakLevels { Labels, Numeric }`. `break N` / `continue N` become
+      labelled jumps to the N-th enclosing loop of the function (loops:
+      `Arch::Loop` and templates with a label hole); hygienic labels made on
+      demand; `ProblemKind::BreakLevel { level, loops }` for 0, non-literals,
+      and levels past the enclosing loops. End to end on bvm-lang; a
+      reference-model property over random nests.
+- [x] **Per-archetype modifiers** (LSF2 §15.5): `MappingBuilder::modifier_in`,
+      `Mapping::modifier_in`, `Arch::lsf_name`; `...` is a rest parameter and
+      a spread argument (end to end); a spread `map_entry` is reported
+      (`Unsupported`), never silently lowered as one element;
+      `MappingError::UnknownArchetype`.
+- [x] **Conditional templates** (LSF2 §15.4, ISSUES P40):
+      `MappingBuilder::template_node_when`; Mox's `include` family.
+- [x] **Default member visibility** (LSF2 `default_visibility`):
+      `LangPolicy::default_member_visibility` (see "Added in review").
+- [x] **Keyword type names** (LSF2 §31): role-less keywords (`array`,
+      `callable`) and literal-role keywords (`null`, `false`, `true`) are
+      their registered `type_name` in a type.
+- [x] Tests (`tests/receivers.rs`, `tests/break_levels.rs`,
+      `tests/modifiers_and_conditions.rs`, a fourth random-tree policy),
+      benchmarks `oop/*` and `oop_off/*`, docs, LSF2 §31.
+
+Dependency wiring (decided here, recorded per the anti-deferral rule):
+- **bcgen-lang 0.4 and bvm-lang `=2.0.0-alpha.4`: dev-dependencies**
+  (registry), to run lowered Mox end to end. Not runtime dependencies:
+  compiling is a later stage (L5), and lower-lang's output must not depend on
+  it. One `hir_lang` 0.4 in the tree.
+- Unchanged: syntax-lang 1, hir-lang 0.4, intern-lang 1 wired; span-lang,
+  macro-lang, diag-lang not wired; lang-forge 1.0.1 and resolve-lang 0.4
+  dev-dependencies (resolve-lang 0.4.1 is what `"0.4"` selects; the
+  `new C` test needs it). No new runtime dependency.
+
+Added in review (same patch):
+- [x] **Default member visibility** (LSF2 `default_visibility`, added to
+      §15.2): `LangPolicy::default_member_visibility`, `Private` by default
+      (0.4.0's behaviour); Mox sets `Public`. A class with no visibility
+      keyword and `parent::__construct(1)` runs end to end.
+- [x] **`new ClassName`** through the sketch's `new_object` template runs end
+      to end: resolve-lang 0.4.1 resolves a class name in value position
+      under `Policy::php()` (`with_class_values`); no lower-lang change was
+      needed, and the test that pinned the 0.4.0 refusal is now a positive
+      one.
+
+Found while building 0.4.1 and **not** done here (moved to v0.5.0, reasons
+recorded):
+- **Spread entries in array literals** need an HIR form (no `MapEntry`
+  spread in hir-lang 0.4); reported precisely meanwhile.
+- **Precise keyword types**: HIR has no `null`, `false`, `true`, `array`, or
+  `callable` type terms, and `TypeName` is not `#[non_exhaustive]`, so they
+  map to the nearest `TypeName` (Mox: `any`). `self` / `static` / `parent`
+  as types (root-only paths) are not lowered as types.
+
 ## v0.5.0 - Implementation
 - [x] Quasi-quoted HIR templates with ${field} holes and hygienic expansion — delivered programmatically in v0.2.0.
 - [x] Budgets; diagnostics with spans; benchmarks — delivered in v0.2.0.
@@ -199,6 +274,10 @@ Dependency wiring (decided here, recorded per the anti-deferral rule):
 - [ ] Gaps found while building 0.3: by-reference `foreach` bindings under PHP
       scoping (needs an HIR reference-binding assignment, reported as
       `CannotHoist` today); attribute name resolution (kept as written).
+- [ ] Moved from v0.4.1 (see that section for the reasons): spread entries in
+      array literals (needs HIR); precise keyword types and `self`/`static`/
+      `parent` as types (needs HIR type terms; `TypeName` additions wait for
+      a minor release).
 
 ## v0.9.0 - Hardening
 - [ ] Fuzzing over random trees **and random mappings** (0.2 fuzzes trees over

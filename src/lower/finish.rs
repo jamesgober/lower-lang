@@ -54,7 +54,11 @@ where
                 id,
                 label,
                 nodes_at,
-            } => (self.finish_template(&f, id, label, nodes_at), false),
+            } => {
+                // A numeric `break N` may have given the loop a label.
+                let label = label.or_else(|| self.own_loop_label(&f));
+                (self.finish_template(&f, id, label, nodes_at), false)
+            }
             Build::RootWrap => (self.finish_module(&f, None), false),
             Build::HoistedLet { name, name_span } => {
                 (self.finish_hoisted(&f, name, name_span), false)
@@ -67,10 +71,17 @@ where
             self.or_depth = self.or_depth.saturating_sub(1);
         }
         self.pop_labels(f.label_mark);
+        self.loops.truncate(f.loop_mark);
         self.vals.truncate(f.vals_base);
         self.counts.truncate(f.counts_base);
         let v = self.settle(v, f.spill_base);
         self.push_place(v, f.span, place);
+    }
+
+    /// The label a numeric `break N` gave the loop `f` opened, if `f` is a
+    /// loop and one did (read before the frame pops its loop entry).
+    fn own_loop_label(&self, f: &Frame<K>) -> Option<hir_lang::BinderId> {
+        self.loops.get(f.loop_mark).and_then(|e| e.label)
     }
 
     /// Moves a spilled result down to the frame's spill base, dropping the
@@ -373,7 +384,17 @@ where
     /// Creates parameter nodes, applying `*` (named-only after) and `/`
     /// (positional-only before) markers.
     fn params(&mut self, f: &Frame<K>, i: usize) -> List<hir_lang::ParamId> {
+        self.params_of(f, i, false)
+    }
+
+    /// The parameters of field `i`; with `receiver`, the implicit receiver
+    /// first, unless a parameter already is the receiver.
+    fn params_of(&mut self, f: &Frame<K>, i: usize, receiver: bool) -> List<hir_lang::ParamId> {
         let vals = self.many(f, i);
+        // A receiver spelled in the source (a `Receiver` modifier) wins.
+        let explicit = vals
+            .iter()
+            .any(|s| matches!(s.v, Val::Param(p, _, _) if p.kind == ParamKind::Receiver));
         let positional_end = vals
             .iter()
             .rposition(|s| matches!(s.v, Val::Marker(ParamKind::PositionalOnly)));
@@ -409,17 +430,57 @@ where
             }
         }
         self.give(vals);
+        if receiver {
+            if let (false, Some(sym)) = (explicit, self.recv_sym) {
+                let id = self.receiver_param(sym, f.name.map_or(f.span, |(_, s)| s));
+                out.insert(0, id);
+            }
+        }
         self.at(f.span);
         let list = self.list(&out);
         self.lists.params = out;
         list
     }
 
+    /// The implicit receiver parameter: kind `Receiver`, binding `sym` as an
+    /// ordinary (unmarked) name, with its origin at the method's name.
+    fn receiver_param(&mut self, sym: Symbol, span: Span) -> hir_lang::ParamId {
+        self.at(span);
+        let binder = self.binder(Name::new(sym), BinderKind::Param, false);
+        let pat = self.pt(Pat::Bind {
+            binder,
+            mode: BindMode::Value,
+            sub: None,
+        });
+        self.nodes += 1;
+        self.b.param(Param {
+            pat,
+            ty: None,
+            default: None,
+            kind: ParamKind::Receiver,
+            by_ref: false,
+        })
+    }
+
+    /// The visibility of `f`'s construct: its most public modifier, or, for
+    /// a member of a class, mixin, or interface without one, the policy's
+    /// default member visibility.
+    fn vis_for(&self, f: &Frame<K>) -> Vis {
+        let any = Modifier::Public.bit()
+            | Modifier::Protected.bit()
+            | Modifier::Private.bit()
+            | Modifier::Package.bit();
+        if f.mods & any == 0 && f.want == Want::Member && self.in_class_body() {
+            return self.m.policy.default_member_visibility;
+        }
+        vis_of(f.mods)
+    }
+
     fn named_item(&mut self, f: &Frame<K>, kind: ItemKind) -> Val {
         let (sym, span) = f.name.unwrap_or((self.empty, f.span));
         self.at(f.span);
         let item = Item::new(Some(Name::new(sym)), kind)
-            .with_vis(vis_of(f.mods))
+            .with_vis(self.vis_for(f))
             .with_name_span(span);
         Val::Item(self.it(item))
     }
@@ -572,7 +633,7 @@ where
             Arch::Fn { .. } => {
                 let (effects, hoisted) = self.pop_fx(span);
                 let generics = self.generics(f, 0, Some(1));
-                let params = self.params(f, 2);
+                let params = self.params_of(f, 2, f.flag);
                 let ret = self.opt_t(f, 3);
                 let throws = self.opt_t(f, 4);
                 let body = self
@@ -752,9 +813,10 @@ where
                 } else {
                     self.at(span);
                     self.nodes += 1;
+                    let vis = self.vis_for(f);
                     let id = self.b.field(FieldDef {
                         name: f.name.map(|(s, sp)| Ident::new(s, sp)),
-                        vis: vis_of(f.mods),
+                        vis,
                         ty,
                         default,
                     });
@@ -1156,10 +1218,11 @@ where
             }
             Arch::Loop { .. } => {
                 let body = self.req_e(f, 0, "body");
+                let label = f.binder.or_else(|| self.own_loop_label(f));
                 return self.done_expr(
                     f,
                     Expr::Loop {
-                        label: f.binder,
+                        label,
                         body,
                         step: None,
                     },
@@ -1226,15 +1289,26 @@ where
                 return self.done_expr(f, Expr::Spawn(e), false);
             }
             Arch::Closure { implicit, .. } => {
+                let spelled = self.fx.last().is_some_and(|x| x.recv_captured);
                 let (effects, hoisted) = self.pop_fx(span);
                 let vals = self.many(f, 0);
-                let caps: Vec<hir_lang::Capture> = vals
-                    .iter()
-                    .filter_map(|s| match s.v {
-                        Val::Cap(c) => Some(c),
-                        _ => None,
-                    })
-                    .collect();
+                let mut caps: Vec<hir_lang::Capture> = Vec::with_capacity(vals.len() + 1);
+                if let (true, false, Some(sym)) = (f.flag, spelled, self.recv_sym) {
+                    // PHP binds `$this` in every non-static closure made in
+                    // a method: a by-value capture of the receiver.
+                    let outer = self.name_path(sym, span, Ns::Value);
+                    self.at(span);
+                    let binder = self.binder(Name::new(sym), BinderKind::Capture, false);
+                    caps.push(hir_lang::Capture {
+                        outer,
+                        binder,
+                        mode: hir_lang::CaptureMode::ByValue,
+                    });
+                }
+                caps.extend(vals.iter().filter_map(|s| match s.v {
+                    Val::Cap(c) => Some(c),
+                    _ => None,
+                }));
                 self.give(vals);
                 let captures = self.list(&caps);
                 let params = self.params(f, 1);

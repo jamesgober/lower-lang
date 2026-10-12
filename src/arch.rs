@@ -1103,4 +1103,532 @@ impl<K> Arch<K> {
             Self::IntersectionTy { .. } => "intersection type",
         }
     }
+
+    /// The archetype's LSF2 name: the value of `arch = "…"` in
+    /// `[semantics.bind]` (LSF2 §15.4), and the key
+    /// [`MappingBuilder::modifier_in`](crate::MappingBuilder::modifier_in)
+    /// takes. Archetypes LSF2 has no `arch` value for use the snake case of
+    /// the variant (`mixin_rule`, `use_tree`, `attr_arg`, `template`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lower_lang::{Arch, Pick};
+    ///
+    /// let param: Arch<u8> = Arch::Param { pat: Pick::Nth(0), ty: Pick::Absent, default: Pick::Absent };
+    /// assert_eq!(param.lsf_name(), "param");
+    /// assert_eq!(Arch::<u8>::binary().lsf_name(), "binary");
+    /// ```
+    #[must_use]
+    pub const fn lsf_name(&self) -> &'static str {
+        match self {
+            Self::Module { .. } => "module",
+            Self::Pass { .. } => "pass",
+            Self::Splice { .. } => "splice",
+            Self::Unsupported => "unsupported",
+            Self::Let { .. } => "let",
+            Self::ExprStmt { .. } => "expr_stmt",
+            Self::Defer { .. } => "defer",
+            Self::Static { .. } => "static",
+            Self::GlobalDecl { .. } => "global_decl",
+            Self::Import { .. } => "import",
+            Self::Fn { .. } => "fn",
+            Self::Record { .. } => "record",
+            Self::Sum { .. } => "sum",
+            Self::Interface { .. } => "interface",
+            Self::Class { .. } => "class",
+            Self::Impl { .. } => "impl",
+            Self::Alias { .. } => "alias",
+            Self::AssocType { .. } => "assoc_type",
+            Self::Const { .. } => "const",
+            Self::GlobalVar { .. } => "global_var",
+            Self::MixinUse { .. } => "mixin_use",
+            Self::MixinRule { .. } => "mixin_rule",
+            Self::UseTree { .. } => "use_tree",
+            Self::Interp { .. } => "interpolate",
+            Self::Attr { .. } => "attribute",
+            Self::AttrArg { .. } => "attr_arg",
+            Self::FieldDecl { .. } => "field_decl",
+            Self::VariantDecl { .. } => "variant_decl",
+            Self::GenericParam { .. } => "generic_param",
+            Self::WherePred { .. } => "where_pred",
+            Self::Param { .. } => "param",
+            Self::Capture { .. } => "capture",
+            Self::Path { .. } => "path",
+            Self::Segment { .. } => "segment",
+            Self::AssocBinding { .. } => "assoc_binding",
+            Self::Unary { .. } => "unary",
+            Self::Binary { .. } => "binary",
+            Self::Postfix { .. } => "postfix",
+            Self::Assign { .. } => "assign",
+            Self::RefAssign { .. } => "ref_assign",
+            Self::Call { .. } => "call",
+            Self::Arg { .. } => "arg",
+            Self::Member { .. } => "member",
+            Self::MethodCall { .. } => "method_call",
+            Self::DynMember { .. } => "dyn_member",
+            Self::Index { .. } => "index",
+            Self::VarVar { .. } => "var_var",
+            Self::Append { .. } => "append",
+            Self::Tuple { .. } => "tuple",
+            Self::Array { .. } => "array",
+            Self::Map { .. } => "map",
+            Self::MapEntry { .. } => "map_entry",
+            Self::RecordLit { .. } => "record_lit",
+            Self::FieldInit { .. } => "field_init",
+            Self::Repeat { .. } => "repeat",
+            Self::Cast { .. } => "cast",
+            Self::Borrow { .. } => "borrow",
+            Self::Deref { .. } => "deref",
+            Self::Block { .. } => "block",
+            Self::If { .. } => "if",
+            Self::Match { .. } => "match",
+            Self::Arm { .. } => "arm",
+            Self::Loop { .. } => "loop",
+            Self::Break { .. } => "break",
+            Self::Continue { .. } => "continue",
+            Self::Return { .. } => "return",
+            Self::Throw { .. } => "throw",
+            Self::Try { .. } => "try",
+            Self::Catch { .. } => "catch",
+            Self::Await { .. } => "await",
+            Self::Yield { .. } => "yield",
+            Self::YieldFrom { .. } => "yield_from",
+            Self::Spawn { .. } => "spawn",
+            Self::Closure { .. } => "closure",
+            Self::Template(_) => "template",
+            Self::WildPat => "wild_pat",
+            Self::RestPat { .. } => "rest_pat",
+            Self::BindPat { .. } => "bind_pat",
+            Self::TuplePat { .. } => "tuple_pat",
+            Self::CtorPat { .. } => "ctor_pat",
+            Self::RecordPat { .. } => "record_pat",
+            Self::FieldPat { .. } => "field_pat",
+            Self::OrPat { .. } => "or_pat",
+            Self::RangePat { .. } => "range_pat",
+            Self::RefPat { .. } => "ref_pat",
+            Self::SlicePat { .. } => "slice_pat",
+            Self::TypeTestPat { .. } => "type_test_pat",
+            Self::TupleTy { .. } => "tuple_ty",
+            Self::ArrayTy { .. } => "array_ty",
+            Self::SliceTy { .. } => "slice_ty",
+            Self::RefTy { .. } => "ref_ty",
+            Self::PtrTy { .. } => "ptr_ty",
+            Self::NullableTy { .. } => "nullable_ty",
+            Self::FnTy { .. } => "fn_ty",
+            Self::ObjectTy { .. } => "object_ty",
+            Self::ImplTy { .. } => "impl_ty",
+            Self::UnionTy { .. } => "union_ty",
+            Self::IntersectionTy { .. } => "intersection_ty",
+        }
+    }
+}
+
+/// Every [`Arch::lsf_name`], for checking the archetype names a mapping is
+/// given ([`modifier_in`](crate::MappingBuilder::modifier_in)). In variant
+/// order; the unit test below checks it against every variant.
+pub(crate) const LSF_NAMES: [&str; 98] = [
+    "module",
+    "pass",
+    "splice",
+    "unsupported",
+    "let",
+    "expr_stmt",
+    "defer",
+    "static",
+    "global_decl",
+    "import",
+    "fn",
+    "record",
+    "sum",
+    "interface",
+    "class",
+    "impl",
+    "alias",
+    "assoc_type",
+    "const",
+    "global_var",
+    "mixin_use",
+    "mixin_rule",
+    "use_tree",
+    "interpolate",
+    "attribute",
+    "attr_arg",
+    "field_decl",
+    "variant_decl",
+    "generic_param",
+    "where_pred",
+    "param",
+    "capture",
+    "path",
+    "segment",
+    "assoc_binding",
+    "unary",
+    "binary",
+    "postfix",
+    "assign",
+    "ref_assign",
+    "call",
+    "arg",
+    "member",
+    "method_call",
+    "dyn_member",
+    "index",
+    "var_var",
+    "append",
+    "tuple",
+    "array",
+    "map",
+    "map_entry",
+    "record_lit",
+    "field_init",
+    "repeat",
+    "cast",
+    "borrow",
+    "deref",
+    "block",
+    "if",
+    "match",
+    "arm",
+    "loop",
+    "break",
+    "continue",
+    "return",
+    "throw",
+    "try",
+    "catch",
+    "await",
+    "yield",
+    "yield_from",
+    "spawn",
+    "closure",
+    "template",
+    "wild_pat",
+    "rest_pat",
+    "bind_pat",
+    "tuple_pat",
+    "ctor_pat",
+    "record_pat",
+    "field_pat",
+    "or_pat",
+    "range_pat",
+    "ref_pat",
+    "slice_pat",
+    "type_test_pat",
+    "tuple_ty",
+    "array_ty",
+    "slice_ty",
+    "ref_ty",
+    "ptr_ty",
+    "nullable_ty",
+    "fn_ty",
+    "object_ty",
+    "impl_ty",
+    "union_ty",
+    "intersection_ty",
+];
+
+/// The canonical (`'static`) spelling of an LSF2 archetype name, or `None`
+/// when no archetype has that name.
+pub(crate) fn lsf_name_of(name: &str) -> Option<&'static str> {
+    LSF_NAMES.iter().copied().find(|n| *n == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mapping::Join;
+    use crate::mapping::NameRef;
+    use crate::template::TemplateId;
+
+    /// One value of every variant, in declaration order.
+    fn every_variant() -> alloc::vec::Vec<Arch<u8>> {
+        let a = Pick::Absent;
+        alloc::vec![
+            Arch::Module { name: a, items: a },
+            Arch::Pass { inner: a },
+            Arch::Splice { items: a },
+            Arch::Unsupported,
+            Arch::Let {
+                pat: a,
+                ty: a,
+                init: a,
+                else_: a,
+                mutable: false,
+                hoist: false
+            },
+            Arch::ExprStmt { expr: a },
+            Arch::Defer { body: a },
+            Arch::Static {
+                name: a,
+                ty: a,
+                init: a
+            },
+            Arch::GlobalDecl { names: a },
+            Arch::Import { path: a, alias: a },
+            Arch::Fn {
+                name: a,
+                generics: a,
+                params: a,
+                ret: a,
+                throws: a,
+                body: a,
+                where_: a
+            },
+            Arch::Record {
+                name: a,
+                generics: a,
+                fields: a,
+                shape: RecordShape::Auto
+            },
+            Arch::Sum {
+                name: a,
+                generics: a,
+                variants: a
+            },
+            Arch::Interface {
+                name: a,
+                generics: a,
+                supers: a,
+                items: a
+            },
+            Arch::Class {
+                name: a,
+                generics: a,
+                bases: a,
+                interfaces: a,
+                members: a,
+                mixin: false
+            },
+            Arch::Impl {
+                generics: a,
+                interface: a,
+                self_ty: a,
+                items: a
+            },
+            Arch::Alias {
+                name: a,
+                generics: a,
+                ty: a
+            },
+            Arch::AssocType {
+                name: a,
+                bounds: a,
+                default: a
+            },
+            Arch::Const {
+                name: a,
+                ty: a,
+                value: a
+            },
+            Arch::GlobalVar {
+                name: a,
+                ty: a,
+                init: a,
+                mutable: false
+            },
+            Arch::MixinUse {
+                mixins: a,
+                rules: a
+            },
+            Arch::MixinRule {
+                from: a,
+                method: a,
+                insteadof: a,
+                alias: a
+            },
+            Arch::UseTree {
+                path: a,
+                alias: a,
+                children: a
+            },
+            Arch::Interp {
+                parts: a,
+                close: a,
+                join: Join::Call(NameRef(0))
+            },
+            Arch::Attr { name: a, args: a },
+            Arch::AttrArg { key: a, value: a },
+            Arch::FieldDecl {
+                name: a,
+                ty: a,
+                default: a
+            },
+            Arch::VariantDecl {
+                name: a,
+                fields: a,
+                discriminant: a,
+                shape: RecordShape::Auto
+            },
+            Arch::GenericParam {
+                name: a,
+                bounds: a,
+                ty: a,
+                default: a
+            },
+            Arch::WherePred {
+                subject: a,
+                bounds: a
+            },
+            Arch::Param {
+                pat: a,
+                ty: a,
+                default: a
+            },
+            Arch::Capture { name: a },
+            Arch::Path {
+                segments: a,
+                global: a,
+                qself: a,
+                qtrait: a
+            },
+            Arch::Segment { name: a, args: a },
+            Arch::AssocBinding { name: a, ty: a },
+            Arch::Unary { op: a, operand: a },
+            Arch::Binary {
+                lhs: a,
+                op: a,
+                rhs: a
+            },
+            Arch::Postfix { operand: a, op: a },
+            Arch::Assign {
+                target: a,
+                op: a,
+                value: a
+            },
+            Arch::RefAssign {
+                target: a,
+                source: a
+            },
+            Arch::Call { callee: a, args: a },
+            Arch::Arg { name: a, value: a },
+            Arch::Member {
+                base: a,
+                member: a,
+                args: a,
+                call: a
+            },
+            Arch::MethodCall {
+                receiver: a,
+                method: a,
+                generics: a,
+                args: a
+            },
+            Arch::DynMember {
+                base: a,
+                name: a,
+                args: a,
+                call: a
+            },
+            Arch::Index { base: a, index: a },
+            Arch::VarVar { inner: a },
+            Arch::Append { base: a },
+            Arch::Tuple { elems: a },
+            Arch::Array { elems: a },
+            Arch::Map { entries: a },
+            Arch::MapEntry { key: a, value: a },
+            Arch::RecordLit {
+                path: a,
+                fields: a,
+                base: a
+            },
+            Arch::FieldInit { name: a, value: a },
+            Arch::Repeat { elem: a, count: a },
+            Arch::Cast { expr: a, ty: a },
+            Arch::Borrow { expr: a },
+            Arch::Deref { inner: a },
+            Arch::Block {
+                stmts: a,
+                tail: a,
+                label: a,
+                tail_from_last: false
+            },
+            Arch::If {
+                cond: a,
+                then: a,
+                else_: a
+            },
+            Arch::Match {
+                scrutinee: a,
+                arms: a
+            },
+            Arch::Arm {
+                pat: a,
+                guard: a,
+                body: a
+            },
+            Arch::Loop { label: a, body: a },
+            Arch::Break { label: a, value: a },
+            Arch::Continue { label: a },
+            Arch::Return { value: a },
+            Arch::Throw { value: a },
+            Arch::Try {
+                body: a,
+                catches: a,
+                finally: a
+            },
+            Arch::Catch {
+                types: a,
+                name: a,
+                body: a
+            },
+            Arch::Await { inner: a },
+            Arch::Yield { key: a, value: a },
+            Arch::YieldFrom { inner: a },
+            Arch::Spawn { inner: a },
+            Arch::Closure {
+                params: a,
+                ret: a,
+                captures: a,
+                body: a,
+                implicit: None
+            },
+            Arch::Template(TemplateUse {
+                template: TemplateId(0),
+                first: 0,
+                len: 0
+            }),
+            Arch::WildPat,
+            Arch::RestPat { bind: a },
+            Arch::BindPat { name: a, sub: a },
+            Arch::TuplePat { elems: a },
+            Arch::CtorPat { path: a, elems: a },
+            Arch::RecordPat { path: a, fields: a },
+            Arch::FieldPat { name: a, pat: a },
+            Arch::OrPat { alts: a },
+            Arch::RangePat { lo: a, hi: a },
+            Arch::RefPat { inner: a },
+            Arch::SlicePat { elems: a },
+            Arch::TypeTestPat { ty: a, pat: a },
+            Arch::TupleTy { elems: a },
+            Arch::ArrayTy { elem: a, len: a },
+            Arch::SliceTy { elem: a },
+            Arch::RefTy {
+                inner: a,
+                region: a
+            },
+            Arch::PtrTy { inner: a },
+            Arch::NullableTy { inner: a },
+            Arch::FnTy { params: a, ret: a },
+            Arch::ObjectTy { bounds: a },
+            Arch::ImplTy { bounds: a },
+            Arch::UnionTy { members: a },
+            Arch::IntersectionTy { members: a },
+        ]
+    }
+
+    #[test]
+    fn test_lsf_names_cover_every_variant_once() {
+        let all = every_variant();
+        assert_eq!(all.len(), LSF_NAMES.len());
+        for (arch, name) in all.iter().zip(LSF_NAMES) {
+            assert_eq!(arch.lsf_name(), name);
+            assert_eq!(lsf_name_of(name), Some(name));
+        }
+        let mut sorted = LSF_NAMES;
+        sorted.sort_unstable();
+        assert!(sorted.windows(2).all(|w| w[0] != w[1]), "names are unique");
+        assert_eq!(lsf_name_of("parameter"), None);
+        assert_eq!(lsf_name_of(""), None);
+    }
 }
