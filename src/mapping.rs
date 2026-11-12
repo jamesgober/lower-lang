@@ -246,7 +246,7 @@ pub enum EffectMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum IdentPatterns {
     /// `Pat::Ident`: the resolver decides between a constant or unit variant
-    /// and a new binding (Rust, Kraken).
+    /// and a new binding (Rust).
     #[default]
     Ident,
     /// Always a new binding.
@@ -289,7 +289,7 @@ pub enum PlaceArgs {
 #[non_exhaustive]
 pub enum BreakLevels {
     /// A name: `break 'outer` targets the loop or block labelled `'outer`
-    /// (Rust, Kraken, JavaScript).
+    /// (Rust, JavaScript).
     #[default]
     Labels,
     /// A count: `break 2` / `continue 2` target the second enclosing loop of
@@ -317,7 +317,7 @@ pub enum BreakLevels {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Separators {
     /// After the first digit, anywhere and repeated (`1_000`, `1__0`, `10_`;
-    /// Rust, Kraken).
+    /// Rust).
     #[default]
     Anywhere,
     /// Only between two digits of the number's radix: `1_000` and `0xFF_FF`,
@@ -339,7 +339,7 @@ pub enum Separators {
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum LegacyOctal {
-    /// Decimal: `0777` is 777 (Rust, Kraken).
+    /// Decimal: `0777` is 777 (Rust).
     #[default]
     Decimal,
     /// Octal: `0777` is 511, and `08` is invalid (C, PHP, JavaScript sloppy

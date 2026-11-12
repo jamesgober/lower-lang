@@ -159,7 +159,7 @@ Delivered:
       `[semantics.lower]` form works through `Template::hole_index`. The
       `let_place` forms of the sketch's `pre_increment`, `pre_decrement`,
       `post_increment`, `post_decrement` are in `tests/textual.rs` and
-      `examples/textual.rs` (the coordinator updates the sketch).
+      `examples/textual.rs`.
 - [x] Fixed: `Arch::RefAssign` was never finished (orphaned operands).
 - [x] Tests: parse-equals-builder differential property, hostile text,
       depth cap on a small stack, every error kind; Mox end to end with
@@ -282,7 +282,7 @@ recorded):
 ## v0.9.0 - Hardening
 - [ ] Fuzzing over random trees **and random mappings** (0.2 fuzzes trees over
       fixed mappings only); audit against LexerSketch target-language sketches
-      (Mox, HQL scalar expressions, Kraken subset, Iron, Mercury).
+      (Mox, HQL scalar expressions, Iron, Mercury).
 
 ## v1.0.0 - Stable
 - [ ] Frozen after the LexerSketch app lowers at least three target languages through it (D18).
