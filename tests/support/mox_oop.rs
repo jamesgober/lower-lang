@@ -1,5 +1,5 @@
 //! Mox with classes, numeric break levels, `...`, and the `include` family:
-//! the parts of `_lexersketch/sketches/mox.lsf` that lower-lang 0.4.1 adds,
+//! the parts of the Mox sketch that lower-lang 0.4.1 adds,
 //! with trees built directly (the shapes lang-forge 2.0 gives Mox's rules)
 //! and a mapping that sets exactly the keys the sketch sets:
 //!

@@ -1,6 +1,6 @@
 //! The mapping: a language's semantics as data.
 //!
-//! A [`Mapping`] mirrors LexerSketch's LSF2 `[semantics]` sections:
+//! A [`Mapping`] mirrors the toolchain's LSF2 `[semantics]` sections:
 //! node kinds to [`Arch`]etypes (`[semantics.bind]`), templates
 //! (`[semantics.lower]`), and operators with their policies
 //! (`[semantics.ops]`), plus the token roles, modifiers, and path roots that

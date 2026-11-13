@@ -1,6 +1,6 @@
 //! Lowering templates: small HIR-shaped ASTs with `${field}` holes.
 //!
-//! A template is what LexerSketch's `[semantics.templates]` section writes as
+//! A template is what the toolchain's `[semantics.templates]` section writes as
 //! quasi-quoted HIR (`while = "loop { if ${cond} {} else { break }; ${body} }"`).
 //! Templates are built programmatically with a [`TemplateBuilder`], or parsed
 //! from that text with [`Template::parse`] (the `text` module, a pure front

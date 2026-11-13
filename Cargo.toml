@@ -19,7 +19,7 @@ readme = "README.md"
 description = "Lowers lossless syntax trees into HIR through declarative semantic archetypes and hygienic templates."
 
 # Keywords (5 max)
-keywords = ["lowering", "hir", "compiler", "language", "lexersketch"]
+keywords = ["lowering", "hir", "compiler", "language"]
 
 # Categories
 categories = ["compilers", "development-tools", "no-std"]
