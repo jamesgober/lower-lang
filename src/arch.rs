@@ -1,6 +1,6 @@
 //! The archetype catalogue: the semantic forms a construct can be declared as.
 //!
-//! Each variant of [`Arch`] is one archetype from LexerSketch's semantic layer
+//! Each variant of [`Arch`] is one archetype from the toolchain's semantic layer
 //! (ARCHITECTURE §5): binders, scopes, declarations, control, expressions,
 //! patterns, and types. Its fields are [`Pick`]s that say where each part of
 //! the construct sits among the node's children. Flags that a construct

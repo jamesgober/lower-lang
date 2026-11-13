@@ -111,7 +111,7 @@ miscompile before; none changes a correct program's HIR):
 ## [0.4.0] - 2026-10-12
 
 Textual templates (decision D26), hir-lang 0.4, and the resolver in the loop:
-the step that lets LexerSketch lower Mox's `echo`, `print`, `&&`, `||`, and
+the step that lets the toolchain lower Mox's `echo`, `print`, `&&`, `||`, and
 `++$i` (LSF5105) on one `hir_lang` shared with resolve-lang 0.4 and
 typeck-lang 0.3.
 

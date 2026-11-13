@@ -2,7 +2,7 @@
 
 > Complete reference for every public item in `lower-lang`, with examples.
 > **Status: pre-1.0 (0.4.1: implicit receivers, numeric break levels, per-archetype modifiers, conditional templates).** The surface is designed across the
-> 0.x series and frozen at 1.0, after the LexerSketch app has lowered at least
+> 0.x series and frozen at 1.0, after the toolchain's app has lowered at least
 > three target languages through it (decision D18). See
 > [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
@@ -203,7 +203,7 @@ application is a nested expansion counted against
 
 ### Textual templates
 
-LexerSketch sketches write templates as text in HIR's textual syntax (HIR
+The toolchain sketches write templates as text in HIR's textual syntax (HIR
 spec §20, LSF2 §15.8). [`Template::parse`](#template) parses such a text into
 the same [`Template`](#template) the builder makes, and
 [`MappingBuilder::parse_template`](#mappingbuilder) parses and registers it
@@ -871,7 +871,7 @@ assert!(b.build().is_ok());
 ```
 
 Hole counts are checked as for `template_node` (`MappingError::HoleCount`).
-A `{ hook = … }` alternative is LexerSketch's (lowering capabilities), not
+A `{ hook = … }` alternative is the toolchain's (lowering capabilities), not
 lower-lang's.
 
 ## `Pick`

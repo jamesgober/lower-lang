@@ -1,7 +1,6 @@
 # lower-lang - Roadmap
 
 > Path from scaffold to a stable 1.0. Hard parts are front-loaded; each phase has hard exit criteria.
-> Master plan: ../_lexersketch/ROADMAP.md and ../_lexersketch/NEW-LIBS.md
 >
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
 
@@ -74,7 +73,7 @@ Dependency wiring (decided here, recorded per the anti-deferral rule):
   macro-lang works on token trees (L2 EXPAND, before lowering). Revisit only
   if macro-lang 2.0 grows an HIR-level API.
 - **diag-lang: not wired.** `Problem` carries a span and a kind; turning it
-  into a `diag_lang::Diagnostic` is one line in the host (the LexerSketch
+  into a `diag_lang::Diagnostic` is one line in the host (the toolchain
   app) and would make every user of lower-lang depend on diag-lang. Additive
   later if wanted.
 - **lang-forge: dev-dependency only** (registry 1.0.1), for the worked example.
@@ -125,7 +124,7 @@ Dependency wiring (decided here, recorded per the anti-deferral rule):
   lang-forge 1.0.1 dev-dependency).
 
 ## v0.4.0 - Resolver in the loop, hir-lang 0.4, textual templates (DONE)
-The shortest path to the LexerSketch Demo (G3, "Mox programs print"):
+The shortest path to the toolchain demo (G3, "Mox programs print"):
 resolve-lang 0.4 and typeck-lang 0.3 are on hir-lang 0.4, so lower-lang had
 to move too, and Mox's `echo`, `print`, `&&`, `||`, and `++$i` were blocked on
 textual templates (LSF5105). Decision D26 pulled textual templates forward
@@ -281,8 +280,8 @@ recorded):
 
 ## v0.9.0 - Hardening
 - [ ] Fuzzing over random trees **and random mappings** (0.2 fuzzes trees over
-      fixed mappings only); audit against LexerSketch target-language sketches
+      fixed mappings only); audit against the toolchain target-language sketches
       (Mox, HQL scalar expressions, Iron, Mercury).
 
 ## v1.0.0 - Stable
-- [ ] Frozen after the LexerSketch app lowers at least three target languages through it (D18).
+- [ ] Frozen after the toolchain's app lowers at least three target languages through it (D18).

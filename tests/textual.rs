@@ -1,6 +1,6 @@
 //! Textual templates end to end: every template text of the Mox sketch
-//! (`_lexersketch/sketches/mox.lsf`, `[semantics.templates]`) is parsed and
-//! registered the way LexerSketch's `ls-sema` does (LSF2 §15.11: used
+//! (the Mox sketch, `[semantics.templates]`) is parsed and
+//! registered the way the toolchain's `ls-sema` does (LSF2 §15.11: used
 //! built-ins first, then the texts in document order), Mox trees using
 //! them are lowered, and the HIR is validated and resolved through
 //! resolve-lang 0.4: `&&`, `||`, `++`, `--`, `echo`, `print`, `.=`, `??=`,

@@ -342,7 +342,7 @@ fn syntax(text: &str) -> (SyntaxError, usize, usize) {
 
 // ------------------------------------------------------------ Mox templates
 
-/// `[semantics.templates]` of `_lexersketch/sketches/mox.lsf` (2026-10-11),
+/// `[semantics.templates]` of the Mox sketch (2026-10-11),
 /// verbatim, then the `let_place` rewrites.
 const MOX_TEMPLATES: [(&str, &str); 22] = [
     ("bool_and", "if ${lhs} { not(not(${rhs})) } else { false }"),
